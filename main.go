@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -15,6 +18,10 @@ import (
 
 var db *pgxpool.Pool
 
+// ⚠️ IMPORTANT: Change this to a long, random string. 
+// It MUST match the secretKey in your bot's license.go exactly.
+const secretKey = "OdibetsSuperSecretKey2026!"
+
 type ActivationRequest struct {
 	Key      string `json:"key"`
 	DeviceID string `json:"device_id"`
@@ -23,6 +30,14 @@ type ActivationRequest struct {
 type ActivationResponse struct {
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
+	Token  string `json:"token,omitempty"`
+}
+
+// generateToken creates the un-forgeable signature
+func generateToken(deviceID string) string {
+	mac := hmac.New(sha256.New, []byte(secretKey))
+	mac.Write([]byte(deviceID))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func main() {
@@ -160,31 +175,38 @@ func handleActivate(w http.ResponseWriter, r *http.Request) {
 	var existingDeviceID *string
 	var activatedAt time.Time
 	
-	// THIS IS THE CRITICAL LINE: It searches the database for the key.
 	err := db.QueryRow(ctx, "SELECT device_id, activated_at FROM licenses WHERE license_key = $1", req.Key).Scan(&existingDeviceID, &activatedAt)
 	
 	if err != nil { 
-		// Key does NOT exist in our pre-generated list.
+		// Key does NOT exist in our pre-generated list of 11,000 keys
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(ActivationResponse{Status: "invalid", Error: "Invalid license key."})
 		return
 	}
 
-	// Key exists, check if it has been used
 	if existingDeviceID == nil {
-		// It's a fresh key! Bind it to the device.
+		// Fresh key! Bind it to the device and send the token.
 		_, updateErr := db.Exec(ctx, "UPDATE licenses SET device_id = $1, activated_at = NOW() WHERE license_key = $2", req.DeviceID, req.Key)
 		if updateErr != nil {
 			http.Error(w, "Database error", http.StatusInternalServerError)
 			return
 		}
-		json.NewEncoder(w).Encode(ActivationResponse{Status: "activated"})
+		
+		// Send back the success status AND the secure token
+		json.NewEncoder(w).Encode(ActivationResponse{
+			Status: "activated", 
+			Token: generateToken(req.DeviceID),
+		})
 		return
 	}
 
 	// Key is already used. Check if it's the SAME device (re-install)
 	if *existingDeviceID == req.DeviceID {
-		json.NewEncoder(w).Encode(ActivationResponse{Status: "activated"})
+		// Send back the success status AND the secure token
+		json.NewEncoder(w).Encode(ActivationResponse{
+			Status: "activated", 
+			Token: generateToken(req.DeviceID),
+		})
 	} else {
 		// Used on a DIFFERENT machine!
 		w.WriteHeader(http.StatusConflict)
