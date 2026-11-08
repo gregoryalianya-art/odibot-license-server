@@ -18,9 +18,8 @@ import (
 
 var db *pgxpool.Pool
 
-// ⚠️ IMPORTANT: Change this to a long, random string. 
-// It MUST match the secretKey in your bot's license.go exactly.
 const secretKey = "OdibetsSuperSecretKey2026!"
+const adminPassword = "Thecorrupt1.ke"
 
 type ActivationRequest struct {
 	Key      string `json:"key"`
@@ -33,7 +32,6 @@ type ActivationResponse struct {
 	Token  string `json:"token,omitempty"`
 }
 
-// generateToken creates the un-forgeable signature
 func generateToken(deviceID string) string {
 	mac := hmac.New(sha256.New, []byte(secretKey))
 	mac.Write([]byte(deviceID))
@@ -54,6 +52,8 @@ func main() {
 	defer db.Close()
 
 	http.HandleFunc("/", handleDashboard)
+	http.HandleFunc("/login", handleLogin)
+	http.HandleFunc("/logout", handleLogout)
 	http.HandleFunc("/activate", handleActivate)
 
 	port := os.Getenv("PORT")
@@ -65,15 +65,18 @@ func main() {
 }
 
 // ==========================================
-// 1. THE DASHBOARD (To view keys)
+// 1. THE DASHBOARD (Protected by Cookie)
 // ==========================================
 func handleDashboard(w http.ResponseWriter, r *http.Request) {
-	// Simple password protection (Change "admin123" to whatever you want)
-	if r.URL.Query().Get("pass") != "admin123" {
-		http.Error(w, "Unauthorized. Add ?pass=admin123 to the URL", http.StatusUnauthorized)
+	// Check for the login cookie
+	cookie, err := r.Cookie("admin_session")
+	if err != nil || cookie.Value != "authenticated" {
+		// Not logged in. Show the login screen.
+		showLoginPage(w, r.URL.Query().Get("error") == "1")
 		return
 	}
 
+	// If we get here, the cookie is valid. Show the data.
 	rows, err := db.Query(context.Background(), "SELECT license_key, device_id FROM licenses ORDER BY activated_at DESC NULLS LAST, license_key ASC")
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
@@ -100,7 +103,6 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		keys = append(keys, KeyData{Key: key, Status: status})
 	}
 
-	// Render HTML
 	tmpl := `
 	<html>
 	<head>
@@ -113,9 +115,11 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 			.used { color: red; }
 			.avail { color: green; font-weight: bold; }
 			input { padding: 8px; width: 300px; margin-bottom: 20px; }
+			.btn { padding: 10px 20px; background: red; color: white; border: none; border-radius: 4px; float: right; cursor: pointer; }
 		</style>
 	</head>
 	<body>
+		<form action="/logout" method="POST"><button class="btn" type="submit">Logout</button></form>
 		<h2>License Key Dashboard</h2>
 		<input type="text" id="search" onkeyup="filterTable()" placeholder="Search for keys...">
 		<table id="keyTable">
@@ -155,7 +159,78 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 // ==========================================
-// 2. THE ACTIVATION API (For the Bot)
+// 2. LOGIN & LOGOUT
+// ==========================================
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	password := r.FormValue("password")
+	if password == adminPassword {
+		// Password correct: Set a secure HTTP-only cookie
+		http.SetCookie(w, &http.Cookie{
+			Name:     "admin_session",
+			Value:    "authenticated",
+			Path:     "/",
+			HttpOnly: true,
+			MaxAge:   86400, // 1 day
+		})
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	} else {
+		// Password wrong: Redirect back with an error flag
+		http.Redirect(w, r, "/?error=1", http.StatusSeeOther)
+	}
+}
+
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	// Delete the cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "admin_session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func showLoginPage(w http.ResponseWriter, hasError bool) {
+	errMsg := ""
+	if hasError {
+		errMsg = `<p style="color:red;">Incorrect password. Try again.</p>`
+	}
+
+	tmpl := `
+	<html>
+	<head>
+		<title>Admin Login</title>
+		<style>
+			body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f4f4f9; margin: 0; }
+			.login-box { background: white; padding: 40px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); text-align: center; }
+			input[type="password"] { padding: 10px; width: 250px; margin: 10px 0; border: 1px solid #ccc; border-radius: 4px; }
+			button { padding: 10px 20px; background: #333; color: white; border: none; border-radius: 4px; cursor: pointer; width: 270px; }
+		</style>
+	</head>
+	<body>
+		<div class="login-box">
+			<h2>Admin Access</h2>
+			` + errMsg + `
+			<form action="/login" method="POST">
+				<input type="password" name="password" placeholder="Enter admin password" required><br>
+				<button type="submit">Login</button>
+			</form>
+		</div>
+	</body>
+	</html>`
+
+	t, _ := template.New("login").Parse(tmpl)
+	t.Execute(w, nil)
+}
+
+// ==========================================
+// 3. THE ACTIVATION API (For the Bot)
 // ==========================================
 func handleActivate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -178,21 +253,18 @@ func handleActivate(w http.ResponseWriter, r *http.Request) {
 	err := db.QueryRow(ctx, "SELECT device_id, activated_at FROM licenses WHERE license_key = $1", req.Key).Scan(&existingDeviceID, &activatedAt)
 	
 	if err != nil { 
-		// Key does NOT exist in our pre-generated list of 11,000 keys
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(ActivationResponse{Status: "invalid", Error: "Invalid license key."})
 		return
 	}
 
 	if existingDeviceID == nil {
-		// Fresh key! Bind it to the device and send the token.
 		_, updateErr := db.Exec(ctx, "UPDATE licenses SET device_id = $1, activated_at = NOW() WHERE license_key = $2", req.DeviceID, req.Key)
 		if updateErr != nil {
 			http.Error(w, "Database error", http.StatusInternalServerError)
 			return
 		}
 		
-		// Send back the success status AND the secure token
 		json.NewEncoder(w).Encode(ActivationResponse{
 			Status: "activated", 
 			Token: generateToken(req.DeviceID),
@@ -200,15 +272,12 @@ func handleActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Key is already used. Check if it's the SAME device (re-install)
 	if *existingDeviceID == req.DeviceID {
-		// Send back the success status AND the secure token
 		json.NewEncoder(w).Encode(ActivationResponse{
 			Status: "activated", 
 			Token: generateToken(req.DeviceID),
 		})
 	} else {
-		// Used on a DIFFERENT machine!
 		w.WriteHeader(http.StatusConflict)
 		json.NewEncoder(w).Encode(ActivationResponse{Status: "used", Error: "This key is already activated on another machine."})
 	}
