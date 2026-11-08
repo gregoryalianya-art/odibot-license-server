@@ -159,15 +159,20 @@ func handleActivate(w http.ResponseWriter, r *http.Request) {
 
 	var existingDeviceID *string
 	var activatedAt time.Time
+	
+	// THIS IS THE CRITICAL LINE: It searches the database for the key.
 	err := db.QueryRow(ctx, "SELECT device_id, activated_at FROM licenses WHERE license_key = $1", req.Key).Scan(&existingDeviceID, &activatedAt)
 	
 	if err != nil { 
+		// Key does NOT exist in our pre-generated list.
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(ActivationResponse{Status: "invalid", Error: "Invalid license key."})
 		return
 	}
 
+	// Key exists, check if it has been used
 	if existingDeviceID == nil {
+		// It's a fresh key! Bind it to the device.
 		_, updateErr := db.Exec(ctx, "UPDATE licenses SET device_id = $1, activated_at = NOW() WHERE license_key = $2", req.DeviceID, req.Key)
 		if updateErr != nil {
 			http.Error(w, "Database error", http.StatusInternalServerError)
@@ -177,9 +182,11 @@ func handleActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Key is already used. Check if it's the SAME device (re-install)
 	if *existingDeviceID == req.DeviceID {
 		json.NewEncoder(w).Encode(ActivationResponse{Status: "activated"})
 	} else {
+		// Used on a DIFFERENT machine!
 		w.WriteHeader(http.StatusConflict)
 		json.NewEncoder(w).Encode(ActivationResponse{Status: "used", Error: "This key is already activated on another machine."})
 	}
