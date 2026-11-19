@@ -79,6 +79,7 @@ func main() {
 	http.HandleFunc("/restore", handleRestore)
 	http.HandleFunc("/activate", handleActivate)
 	http.HandleFunc("/verify", handleVerify)
+	http.HandleFunc("/usage", handleUsage)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -128,6 +129,23 @@ type KeyRow struct {
 	Revoked     bool
 	Status      string
 	StatusClass string
+	RunsToday   int
+	AcctsToday  int
+	LastRun     string
+}
+
+func humanAgo(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
 }
 
 func handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -136,15 +154,35 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// today's usage comes from the usage table; if it hasn't been created yet the
+	// dashboard still works, just without the counters.
+	hasUsage := true
 	rows, err := db.Query(context.Background(),
-		`SELECT license_key,
-		        COALESCE(owner_name, ''),
-		        COALESCE(device_id, ''),
-		        COALESCE(revoked, false)
-		   FROM licenses
-		  ORDER BY COALESCE(revoked, false) ASC,
-		           COALESCE(owner_name, 'zzzz') ASC,
-		           license_key ASC`)
+		`SELECT l.license_key,
+		        COALESCE(l.owner_name, ''),
+		        COALESCE(l.device_id, ''),
+		        COALESCE(l.revoked, false),
+		        COALESCE(u.runs, 0),
+		        COALESCE(u.accounts, 0),
+		        u.last_run_at
+		   FROM licenses l
+		   LEFT JOIN usage u
+		          ON u.license_key = l.license_key AND u.day = CURRENT_DATE
+		  ORDER BY COALESCE(l.revoked, false) ASC,
+		           COALESCE(l.owner_name, 'zzzz') ASC,
+		           l.license_key ASC`)
+	if err != nil {
+		hasUsage = false
+		rows, err = db.Query(context.Background(),
+			`SELECT license_key,
+			        COALESCE(owner_name, ''),
+			        COALESCE(device_id, ''),
+			        COALESCE(revoked, false)
+			   FROM licenses
+			  ORDER BY COALESCE(revoked, false) ASC,
+			           COALESCE(owner_name, 'zzzz') ASC,
+			           license_key ASC`)
+	}
 	if err != nil {
 		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -154,8 +192,18 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	var keys []KeyRow
 	for rows.Next() {
 		var k KeyRow
-		if err := rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked); err != nil {
+		var last *time.Time
+		ok := false
+		if hasUsage {
+			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked, &k.RunsToday, &k.AcctsToday, &last) == nil
+		} else {
+			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked) == nil
+		}
+		if !ok {
 			continue
+		}
+		if last != nil {
+			k.LastRun = humanAgo(*last)
 		}
 		switch {
 		case k.Revoked:
@@ -169,9 +217,10 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := struct {
-		Rows  []KeyRow
-		Flash string
-	}{Rows: keys, Flash: r.URL.Query().Get("msg")}
+		Rows     []KeyRow
+		Flash    string
+		HasUsage bool
+	}{Rows: keys, Flash: r.URL.Query().Get("msg"), HasUsage: hasUsage}
 
 	tmpl := template.Must(template.New("dash").Parse(dashboardHTML))
 	tmpl.Execute(w, data)
@@ -242,7 +291,7 @@ const dashboardHTML = `
 	{{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
 	<input class="search" type="text" id="search" onkeyup="filterTable()" placeholder="Search user, key or device...">
 	<table id="keyTable">
-		<tr><th style="width:24%">User</th><th style="width:32%">License Key</th><th style="width:26%">Status</th><th style="width:18%">Action</th></tr>
+		<tr><th style="width:20%">User</th><th style="width:26%">License Key</th><th style="width:20%">Status</th>{{if .HasUsage}}<th style="width:22%">Today</th>{{end}}<th style="width:12%">Action</th></tr>
 		{{range .Rows}}
 		<tr>
 			<td data-label="User">
@@ -257,6 +306,12 @@ const dashboardHTML = `
 				<span class="badge {{.StatusClass}}">{{.Status}}</span>
 				{{if .Device}}<div class="dev">{{.Device}}</div>{{end}}
 			</td>
+			{{if $.HasUsage}}
+			<td data-label="Today">
+				{{if .RunsToday}}{{.RunsToday}} run{{if ne .RunsToday 1}}s{{end}} · {{.AcctsToday}} acc{{else}}—{{end}}
+				{{if .LastRun}}<div class="dev">{{.LastRun}}</div>{{end}}
+			</td>
+			{{end}}
 			<td data-label="Action">
 				{{if .Revoked}}
 					<form class="inline" action="/restore" method="POST">
@@ -284,7 +339,6 @@ const dashboardHTML = `
 	</script>
 </body>
 </html>`
-
 
 // ==========================================
 // LOGIN / LOGOUT
@@ -524,6 +578,80 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	if subtle.ConstantTimeCompare([]byte(req.Token), []byte(generateToken(*existingDevice))) != 1 {
 		writeJSON(w, http.StatusForbidden, ActivationResponse{Status: "invalid", Error: "Bad token."})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, ActivationResponse{Status: "ok"})
+}
+
+// handleUsage is called ONCE per run, when the user presses Enter with the Excel loaded.
+// It records how many accounts were loaded. Same auth as /verify, so only the machine
+// that owns the key can write to that key's profile.
+func handleUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Key      string `json:"key"`
+		DeviceID string `json:"device_id"`
+		Token    string `json:"token"`
+		Accounts int    `json:"accounts"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Key == "" || req.DeviceID == "" {
+		writeJSON(w, http.StatusBadRequest, ActivationResponse{Status: "invalid", Error: "key and device_id are required"})
+		return
+	}
+	if req.Accounts < 0 {
+		req.Accounts = 0
+	}
+	if req.Accounts > 100000 {
+		req.Accounts = 100000
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var existingDevice *string
+	var revoked bool
+	err := db.QueryRow(ctx,
+		`SELECT device_id, COALESCE(revoked, false) FROM licenses WHERE license_key = $1`, req.Key).
+		Scan(&existingDevice, &revoked)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			writeJSON(w, http.StatusForbidden, ActivationResponse{Status: "invalid", Error: "Invalid license key."})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, ActivationResponse{Status: "error", Error: "Database error"})
+		return
+	}
+	if revoked {
+		writeJSON(w, http.StatusForbidden, ActivationResponse{Status: "revoked", Error: "This license has been revoked."})
+		return
+	}
+	if existingDevice == nil || *existingDevice != req.DeviceID {
+		writeJSON(w, http.StatusConflict, ActivationResponse{Status: "used", Error: "This key belongs to another machine."})
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(req.Token), []byte(generateToken(*existingDevice))) != 1 {
+		writeJSON(w, http.StatusForbidden, ActivationResponse{Status: "invalid", Error: "Bad token."})
+		return
+	}
+
+	_, err = db.Exec(ctx,
+		`INSERT INTO usage (license_key, day, runs, accounts)
+		 VALUES ($1, CURRENT_DATE, 1, $2)
+		 ON CONFLICT (license_key, day) DO UPDATE
+		    SET runs        = usage.runs + 1,
+		        accounts    = usage.accounts + EXCLUDED.accounts,
+		        last_run_at = NOW()`, req.Key, req.Accounts)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, ActivationResponse{Status: "error", Error: "Usage table missing? Run the SQL."})
 		return
 	}
 
