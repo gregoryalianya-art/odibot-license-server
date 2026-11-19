@@ -159,11 +159,11 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case k.Revoked:
-			k.Status, k.StatusClass = "⛔ Revoked", "revoked"
+			k.Status, k.StatusClass = "Revoked", "revoked"
 		case k.Device != "":
-			k.Status, k.StatusClass = "🔴 Used", "used"
+			k.Status, k.StatusClass = "Used", "used"
 		default:
-			k.Status, k.StatusClass = "🟢 Available", "avail"
+			k.Status, k.StatusClass = "Available", "avail"
 		}
 		keys = append(keys, k)
 	}
@@ -181,52 +181,83 @@ const dashboardHTML = `
 <html>
 <head>
 	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>License Dashboard</title>
 	<style>
-		body { font-family: system-ui, sans-serif; padding: 20px; background: #f4f4f9; margin: 0; }
-		h2 { margin-top: 0; }
-		table { border-collapse: collapse; width: 100%; background: white; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
-		th, td { padding: 10px 12px; border: 1px solid #e2e2e8; text-align: left; vertical-align: middle; }
-		th { background: #2b2b33; color: white; font-size: 13px; letter-spacing: .3px; }
+		* { box-sizing: border-box; }
+		body { font-family: system-ui, -apple-system, sans-serif; padding: 16px; background: #f4f4f9; margin: 0; }
+		h2 { margin: 0 0 12px; font-size: 20px; }
+		.topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+		table { border-collapse: collapse; width: 100%; background: white; box-shadow: 0 1px 3px rgba(0,0,0,.08); border-radius: 8px; overflow: hidden; }
+		th, td { padding: 8px 10px; border-bottom: 1px solid #ececf1; text-align: left; vertical-align: middle; font-size: 13px; }
+		th { background: #2b2b33; color: white; font-size: 11.5px; letter-spacing: .4px; text-transform: uppercase; }
+		tr:last-child td { border-bottom: 0; }
 		.avail { color: #0a7d33; font-weight: 600; }
 		.used { color: #b3261e; font-weight: 600; }
 		.revoked { color: #6b6b75; font-weight: 700; }
-		.dev { color: #777; font-size: 12px; }
-		input[type=text] { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
-		.namebox { width: 150px; }
-		.search { width: 280px; margin-bottom: 14px; }
-		button { padding: 6px 12px; border: 0; border-radius: 4px; cursor: pointer; font-size: 13px; }
+		.badge::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: currentColor; margin-right: 6px; vertical-align: middle; }
+		.dev { color: #8a8a94; font-size: 11px; margin-top: 2px; }
+		input[type=text] { padding: 6px 8px; border: 1px solid #d5d5dd; border-radius: 5px; font-size: 13px; }
+		.namebox { width: 130px; }
+		.search { width: 280px; }
+		button { padding: 6px 11px; border: 0; border-radius: 5px; cursor: pointer; font-size: 12.5px; }
 		.save { background: #2b2b33; color: #fff; }
 		.revoke { background: #b3261e; color: #fff; }
 		.restore { background: #0a7d33; color: #fff; }
-		.logout { background: #2b2b33; color: #fff; float: right; padding: 9px 18px; }
-		.flash { background: #e8f5e9; border: 1px solid #a5d6a7; color: #1b5e20; padding: 10px 14px; margin-bottom: 14px; border-radius: 4px; }
+		.logout { background: #2b2b33; color: #fff; padding: 8px 14px; }
+		.flash { background: #e8f5e9; border: 1px solid #a5d6a7; color: #1b5e20; padding: 9px 12px; margin-bottom: 12px; border-radius: 6px; font-size: 13px; }
 		form.inline { display: inline; margin: 0; }
-		td.mono { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+		td.mono { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+
+		/* ---------- phone layout: each key becomes a compact card ---------- */
+		@media (max-width: 820px) {
+			body { padding: 10px; }
+			h2 { font-size: 18px; }
+			.topbar { margin-bottom: 8px; }
+			.search { width: 100%; }
+			table, tbody, tr, td { display: block; width: 100%; }
+			table { box-shadow: none; background: transparent; border-radius: 0; }
+			thead, tr:first-child { display: none; }
+			tr { background: #fff; border: 1px solid #e4e4ea; border-radius: 8px; margin-bottom: 8px; padding: 8px 10px; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+			td { border: 0; padding: 3px 0; font-size: 13px; }
+			td::before {
+				content: attr(data-label);
+				display: inline-block; width: 46px;
+				color: #9a9aa4; font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px;
+				vertical-align: top;
+			}
+			td.mono { word-break: break-all; line-height: 1.35; }
+			.namebox { width: calc(100% - 112px); }
+			td[data-label="User"]::before { vertical-align: middle; }
+			td[data-label="Action"] { padding-top: 6px; }
+			td[data-label="Action"]::before { vertical-align: middle; }
+		}
 	</style>
 </head>
 <body>
-	<form action="/logout" method="POST"><button class="logout" type="submit">Logout</button></form>
-	<h2>License Keys</h2>
+	<div class="topbar">
+		<h2>License Keys</h2>
+		<form action="/logout" method="POST"><button class="logout" type="submit">Logout</button></form>
+	</div>
 	{{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
 	<input class="search" type="text" id="search" onkeyup="filterTable()" placeholder="Search user, key or device...">
 	<table id="keyTable">
-		<tr><th style="width:22%">User</th><th style="width:30%">License Key</th><th style="width:26%">Status</th><th style="width:22%">Action</th></tr>
+		<tr><th style="width:24%">User</th><th style="width:32%">License Key</th><th style="width:26%">Status</th><th style="width:18%">Action</th></tr>
 		{{range .Rows}}
 		<tr>
-			<td>
+			<td data-label="User">
 				<form class="inline" action="/set-name" method="POST">
 					<input type="hidden" name="key" value="{{.Key}}">
 					<input class="namebox" type="text" name="name" value="{{.Owner}}" placeholder="who is this?">
 					<button class="save" type="submit">Save</button>
 				</form>
 			</td>
-			<td class="mono">{{.Key}}</td>
-			<td>
-				<span class="{{.StatusClass}}">{{.Status}}</span>
+			<td class="mono" data-label="Key">{{.Key}}</td>
+			<td data-label="Status">
+				<span class="badge {{.StatusClass}}">{{.Status}}</span>
 				{{if .Device}}<div class="dev">{{.Device}}</div>{{end}}
 			</td>
-			<td>
+			<td data-label="Action">
 				{{if .Revoked}}
 					<form class="inline" action="/restore" method="POST">
 						<input type="hidden" name="key" value="{{.Key}}">
@@ -253,6 +284,7 @@ const dashboardHTML = `
 	</script>
 </body>
 </html>`
+
 
 // ==========================================
 // LOGIN / LOGOUT
