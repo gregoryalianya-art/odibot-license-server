@@ -65,7 +65,17 @@ func main() {
 	sessionSecret = []byte(secretKey + "|admin-session")
 
 	var err error
-	db, err = pgxpool.New(context.Background(), dbURL)
+	// Supabase's pooler (port 6543) runs in transaction mode and shares backend
+	// connections between clients, so pgx's prepared-statement cache collides:
+	//   prepared statement "stmtcache_..." already exists (42P05)
+	// The simple protocol sends everything in one round trip and keeps no
+	// server-side state, which is what the pooler needs.
+	cfg, cfgErr := pgxpool.ParseConfig(dbURL)
+	if cfgErr != nil {
+		log.Fatalf("Invalid DATABASE_URL: %v\n", cfgErr)
+	}
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	db, err = pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
 	}
