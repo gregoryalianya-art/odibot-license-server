@@ -131,7 +131,27 @@ type KeyRow struct {
 	StatusClass string
 	RunsToday   int
 	AcctsToday  int
+	RunsWeek    int
+	AcctsWeek   int
+	RunsMonth   int
+	AcctsMonth  int
 	LastRun     string
+}
+
+// groupThousands renders 1240 as 1,240 for the dashboard.
+func groupThousands(n int) string {
+	s := strconv.Itoa(n)
+	if len(s) <= 3 {
+		return s
+	}
+	var out []byte
+	for i, c := range []byte(s) {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			out = append(out, ',')
+		}
+		out = append(out, c)
+	}
+	return string(out)
 }
 
 func humanAgo(t time.Time) string {
@@ -154,20 +174,31 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// today's usage comes from the usage table; if it hasn't been created yet the
-	// dashboard still works, just without the counters.
+	// usage is stored one row per key per day, so day / week / month are three
+	// filters over the same rows. Nothing is reset or overwritten.
 	hasUsage := true
 	rows, err := db.Query(context.Background(),
 		`SELECT l.license_key,
 		        COALESCE(l.owner_name, ''),
 		        COALESCE(l.device_id, ''),
 		        COALESCE(l.revoked, false),
-		        COALESCE(u.runs, 0),
-		        COALESCE(u.accounts, 0),
-		        u.last_run_at
+		        COALESCE(u.d_runs, 0),  COALESCE(u.d_acc, 0),
+		        COALESCE(u.w_runs, 0),  COALESCE(u.w_acc, 0),
+		        COALESCE(u.m_runs, 0),  COALESCE(u.m_acc, 0),
+		        u.last_run
 		   FROM licenses l
-		   LEFT JOIN usage u
-		          ON u.license_key = l.license_key AND u.day = CURRENT_DATE
+		   LEFT JOIN (
+		        SELECT license_key,
+		               SUM(runs)     FILTER (WHERE day = CURRENT_DATE) AS d_runs,
+		               SUM(accounts) FILTER (WHERE day = CURRENT_DATE) AS d_acc,
+		               SUM(runs)     FILTER (WHERE day >= date_trunc('week',  CURRENT_DATE)) AS w_runs,
+		               SUM(accounts) FILTER (WHERE day >= date_trunc('week',  CURRENT_DATE)) AS w_acc,
+		               SUM(runs)     FILTER (WHERE day >= date_trunc('month', CURRENT_DATE)) AS m_runs,
+		               SUM(accounts) FILTER (WHERE day >= date_trunc('month', CURRENT_DATE)) AS m_acc,
+		               MAX(last_run_at) AS last_run
+		          FROM usage
+		         GROUP BY license_key
+		   ) u ON u.license_key = l.license_key
 		  ORDER BY COALESCE(l.revoked, false) ASC,
 		           COALESCE(l.owner_name, 'zzzz') ASC,
 		           l.license_key ASC`)
@@ -195,7 +226,11 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		var last *time.Time
 		ok := false
 		if hasUsage {
-			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked, &k.RunsToday, &k.AcctsToday, &last) == nil
+			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked,
+				&k.RunsToday, &k.AcctsToday,
+				&k.RunsWeek, &k.AcctsWeek,
+				&k.RunsMonth, &k.AcctsMonth,
+				&last) == nil
 		} else {
 			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked) == nil
 		}
@@ -222,7 +257,8 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		HasUsage bool
 	}{Rows: keys, Flash: r.URL.Query().Get("msg"), HasUsage: hasUsage}
 
-	tmpl := template.Must(template.New("dash").Parse(dashboardHTML))
+	funcs := template.FuncMap{"n": groupThousands}
+	tmpl := template.Must(template.New("dash").Funcs(funcs).Parse(dashboardHTML))
 	tmpl.Execute(w, data)
 }
 
@@ -246,6 +282,8 @@ const dashboardHTML = `
 		.revoked { color: #6b6b75; font-weight: 700; }
 		.badge::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: currentColor; margin-right: 6px; vertical-align: middle; }
 		.dev { color: #8a8a94; font-size: 11px; margin-top: 2px; }
+		.u { font-size: 12.5px; line-height: 1.55; white-space: nowrap; }
+		.uk { display: inline-block; width: 44px; color: #9a9aa4; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
 		input[type=text] { padding: 6px 8px; border: 1px solid #d5d5dd; border-radius: 5px; font-size: 13px; }
 		.namebox { width: 130px; }
 		.search { width: 280px; }
@@ -278,6 +316,8 @@ const dashboardHTML = `
 			td.mono { word-break: break-all; line-height: 1.35; }
 			.namebox { width: calc(100% - 112px); }
 			td[data-label="User"]::before { vertical-align: middle; }
+			td[data-label="Usage"]::before { display: none; }
+			td[data-label="Usage"] { padding-left: 0; }
 			td[data-label="Action"] { padding-top: 6px; }
 			td[data-label="Action"]::before { vertical-align: middle; }
 		}
@@ -291,7 +331,7 @@ const dashboardHTML = `
 	{{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
 	<input class="search" type="text" id="search" onkeyup="filterTable()" placeholder="Search user, key or device...">
 	<table id="keyTable">
-		<tr><th style="width:20%">User</th><th style="width:26%">License Key</th><th style="width:20%">Status</th>{{if .HasUsage}}<th style="width:22%">Today</th>{{end}}<th style="width:12%">Action</th></tr>
+		<tr><th style="width:20%">User</th><th style="width:24%">License Key</th><th style="width:18%">Status</th>{{if .HasUsage}}<th style="width:26%">Usage</th>{{end}}<th style="width:12%">Action</th></tr>
 		{{range .Rows}}
 		<tr>
 			<td data-label="User">
@@ -307,8 +347,10 @@ const dashboardHTML = `
 				{{if .Device}}<div class="dev">{{.Device}}</div>{{end}}
 			</td>
 			{{if $.HasUsage}}
-			<td data-label="Today">
-				{{if .RunsToday}}{{.RunsToday}} run{{if ne .RunsToday 1}}s{{end}} · {{.AcctsToday}} acc{{else}}—{{end}}
+			<td data-label="Usage">
+				<div class="u"><span class="uk">Day</span>{{if .RunsToday}}{{.RunsToday}} run{{if ne .RunsToday 1}}s{{end}} · {{n .AcctsToday}} acc{{else}}—{{end}}</div>
+				<div class="u"><span class="uk">Week</span>{{if .RunsWeek}}{{.RunsWeek}} runs · {{n .AcctsWeek}} acc{{else}}—{{end}}</div>
+				<div class="u"><span class="uk">Month</span>{{if .RunsMonth}}{{.RunsMonth}} runs · {{n .AcctsMonth}} acc{{else}}—{{end}}</div>
 				{{if .LastRun}}<div class="dev">{{.LastRun}}</div>{{end}}
 			</td>
 			{{end}}
