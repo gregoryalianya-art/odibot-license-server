@@ -199,17 +199,20 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		   FROM licenses l
 		   LEFT JOIN (
 		        SELECT license_key,
-		               SUM(runs)     FILTER (WHERE day = CURRENT_DATE) AS d_runs,
-		               SUM(accounts) FILTER (WHERE day = CURRENT_DATE) AS d_acc,
-		               SUM(runs)     FILTER (WHERE day >= date_trunc('week',  CURRENT_DATE)) AS w_runs,
-		               SUM(accounts) FILTER (WHERE day >= date_trunc('week',  CURRENT_DATE)) AS w_acc,
-		               SUM(runs)     FILTER (WHERE day >= date_trunc('month', CURRENT_DATE)) AS m_runs,
-		               SUM(accounts) FILTER (WHERE day >= date_trunc('month', CURRENT_DATE)) AS m_acc,
+		               SUM(runs)     FILTER (WHERE day = (now() AT TIME ZONE 'Africa/Nairobi')::date) AS d_runs,
+		               SUM(accounts) FILTER (WHERE day = (now() AT TIME ZONE 'Africa/Nairobi')::date) AS d_acc,
+		               SUM(runs)     FILTER (WHERE day >= date_trunc('week',  (now() AT TIME ZONE 'Africa/Nairobi')::date)) AS w_runs,
+		               SUM(accounts) FILTER (WHERE day >= date_trunc('week',  (now() AT TIME ZONE 'Africa/Nairobi')::date)) AS w_acc,
+		               SUM(runs)     FILTER (WHERE day >= date_trunc('month', (now() AT TIME ZONE 'Africa/Nairobi')::date)) AS m_runs,
+		               SUM(accounts) FILTER (WHERE day >= date_trunc('month', (now() AT TIME ZONE 'Africa/Nairobi')::date)) AS m_acc,
 		               MAX(last_run_at) AS last_run
 		          FROM usage
 		         GROUP BY license_key
 		   ) u ON u.license_key = l.license_key
 		  ORDER BY COALESCE(l.revoked, false) ASC,
+		           COALESCE(u.m_runs, 0) DESC,
+		           COALESCE(u.w_runs, 0) DESC,
+		           COALESCE(u.d_runs, 0) DESC,
 		           COALESCE(l.owner_name, 'zzzz') ASC,
 		           l.license_key ASC`)
 	if err != nil {
@@ -339,13 +342,13 @@ const dashboardHTML = `
 		<form action="/logout" method="POST"><button class="logout" type="submit">Logout</button></form>
 	</div>
 	{{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
-	<input class="search" type="text" id="search" onkeyup="filterTable()" placeholder="Search user, key or device...">
+	<input class="search" type="text" id="search" oninput="onSearchInput()" placeholder="Search user, key or device...">
 	<table id="keyTable">
 		<tr><th style="width:20%">User</th><th style="width:24%">License Key</th><th style="width:18%">Status</th>{{if .HasUsage}}<th style="width:26%">Usage</th>{{end}}<th style="width:12%">Action</th></tr>
 		{{range .Rows}}
 		<tr>
 			<td data-label="User">
-				<form class="inline" action="/set-name" method="POST">
+				<form class="inline setname" action="/set-name" method="POST">
 					<input type="hidden" name="key" value="{{.Key}}">
 					<input class="namebox" type="text" name="name" value="{{.Owner}}" placeholder="who is this?">
 					<button class="save" type="submit">Save</button>
@@ -381,12 +384,64 @@ const dashboardHTML = `
 		{{end}}
 	</table>
 	<script>
-		function filterTable() {
-			var f = document.getElementById("search").value.toUpperCase();
+		// Save a name without reloading the page. A normal form POST reloads the
+		// whole table and throws you back to the top, thousands of rows away.
+		document.addEventListener('submit', function (e) {
+			var f = e.target;
+			if (!f || !f.classList || !f.classList.contains('setname')) return;
+			e.preventDefault();
+
+			var btn = f.querySelector('button');
+			var label = btn.textContent;
+			btn.disabled = true;
+			btn.textContent = '...';
+
+			fetch(f.action, { method: 'POST', body: new FormData(f), credentials: 'same-origin', headers: { 'X-Requested-With': 'fetch' } })
+				.then(function (resp) {
+					if (resp.status === 401) {
+						btn.textContent = 'Login';
+						setTimeout(function () { window.location.href = '/'; }, 900);
+						return;
+					}
+					if (!resp.ok && resp.status !== 204) throw new Error('http ' + resp.status);
+					btn.textContent = 'Saved';
+					searchIndex = null;   // the name changed - rebuild the search index
+					setTimeout(function () { btn.textContent = label; btn.disabled = false; }, 1200);
+				})
+				.catch(function () {
+					btn.textContent = 'Retry';
+					btn.disabled = false;
+				});
+		});
+
+		var searchIndex = null;
+		var searchTimer = null;
+
+		// Build the searchable text once per page load. Names live in input
+		// values, so textContent alone can never match a user name.
+		function buildSearchIndex() {
 			var tr = document.getElementById("keyTable").getElementsByTagName("tr");
+			searchIndex = [];
 			for (var i = 1; i < tr.length; i++) {
-				tr[i].style.display = (tr[i].textContent || tr[i].innerText).toUpperCase().indexOf(f) > -1 ? "" : "none";
+				var row = tr[i];
+				var owner = row.querySelector('input[name="name"]');
+				var text = (row.textContent || row.innerText) + " " + (owner ? owner.value : "");
+				searchIndex.push({ el: row, t: text.toUpperCase() });
 			}
+		}
+
+		function filterTable() {
+			if (!searchIndex) buildSearchIndex();
+			var f = document.getElementById("search").value.toUpperCase();
+			for (var i = 0; i < searchIndex.length; i++) {
+				searchIndex[i].el.style.display = searchIndex[i].t.indexOf(f) > -1 ? "" : "none";
+			}
+		}
+
+		// Wait for a pause in typing instead of filtering on every keystroke.
+		function onSearchInput() {
+			clearTimeout(searchTimer);
+			searchTimer = setTimeout(filterTable, 150);
 		}
 	</script>
 </body>
@@ -451,6 +506,12 @@ func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	if !validSession(r) {
+		// an ajax caller must not be handed the login page with a 200 - it would
+		// look like the save worked
+		if r.Header.Get("X-Requested-With") == "fetch" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return false
+		}
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return false
 	}
@@ -472,6 +533,13 @@ func handleSetName(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
+	// Saved from the page itself: no redirect, no reload, no re-download of
+	// the whole table. The button confirms in place.
+	if r.Header.Get("X-Requested-With") == "fetch" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	msg := "Name saved"
 	if name == "" {
 		msg = "Name cleared"
@@ -697,7 +765,7 @@ func handleUsage(w http.ResponseWriter, r *http.Request) {
 
 	_, err = db.Exec(ctx,
 		`INSERT INTO usage (license_key, day, runs, accounts)
-		 VALUES ($1, CURRENT_DATE, 1, $2)
+		 VALUES ($1, (now() AT TIME ZONE 'Africa/Nairobi')::date, 1, $2)
 		 ON CONFLICT (license_key, day) DO UPDATE
 		    SET runs        = usage.runs + 1,
 		        accounts    = usage.accounts + EXCLUDED.accounts,
