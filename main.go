@@ -11,6 +11,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -184,10 +185,41 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	page := 1
+	if v, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && v > 0 {
+		page = v
+	}
+	perPage := 50
+	like := "%" + q + "%"
+
+	ctx := context.Background()
+
+	// how many keys match the search - needed for the page count
+	var total int
+	if err := db.QueryRow(ctx,
+		`SELECT count(*) FROM licenses l
+		  WHERE $1 = '%%'
+		     OR l.license_key ILIKE $1
+		     OR COALESCE(l.owner_name, '') ILIKE $1
+		     OR COALESCE(l.device_id, '') ILIKE $1`, like).Scan(&total); err != nil {
+		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	pages := (total + perPage - 1) / perPage
+	if pages < 1 {
+		pages = 1
+	}
+	if page > pages {
+		page = pages
+	}
+	offset := (page - 1) * perPage
+
 	// usage is stored one row per key per day, so day / week / month are three
 	// filters over the same rows. Nothing is reset or overwritten.
 	hasUsage := true
-	rows, err := db.Query(context.Background(),
+	rows, err := db.Query(ctx,
 		`SELECT l.license_key,
 		        COALESCE(l.owner_name, ''),
 		        COALESCE(l.device_id, ''),
@@ -209,23 +241,33 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		          FROM usage
 		         GROUP BY license_key
 		   ) u ON u.license_key = l.license_key
+		  WHERE $1 = '%%'
+		     OR l.license_key ILIKE $1
+		     OR COALESCE(l.owner_name, '') ILIKE $1
+		     OR COALESCE(l.device_id, '') ILIKE $1
 		  ORDER BY COALESCE(l.revoked, false) ASC,
 		           COALESCE(u.m_runs, 0) DESC,
 		           COALESCE(u.w_runs, 0) DESC,
 		           COALESCE(u.d_runs, 0) DESC,
 		           COALESCE(l.owner_name, 'zzzz') ASC,
-		           l.license_key ASC`)
+		           l.license_key ASC
+		  LIMIT $2 OFFSET $3`, like, perPage, offset)
 	if err != nil {
 		hasUsage = false
-		rows, err = db.Query(context.Background(),
+		rows, err = db.Query(ctx,
 			`SELECT license_key,
 			        COALESCE(owner_name, ''),
 			        COALESCE(device_id, ''),
 			        COALESCE(revoked, false)
 			   FROM licenses
+			  WHERE $1 = '%%'
+			     OR license_key ILIKE $1
+			     OR COALESCE(owner_name, '') ILIKE $1
+			     OR COALESCE(device_id, '') ILIKE $1
 			  ORDER BY COALESCE(revoked, false) ASC,
 			           COALESCE(owner_name, 'zzzz') ASC,
-			           license_key ASC`)
+			           license_key ASC
+			  LIMIT $2 OFFSET $3`, like, perPage, offset)
 	}
 	if err != nil {
 		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
@@ -268,15 +310,38 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		Rows     []KeyRow
 		Flash    string
 		HasUsage bool
-	}{Rows: keys, Flash: r.URL.Query().Get("msg"), HasUsage: hasUsage}
+		Q        string
+		Page     int
+		Pages    int
+		Total    int
+		PerPage  int
+		Prev     int
+		Next     int
+		HasPrev  bool
+		HasNext  bool
+	}{
+		Rows:     keys,
+		Flash:    r.URL.Query().Get("msg"),
+		HasUsage: hasUsage,
+		Q:        q,
+		Page:     page,
+		Pages:    pages,
+		Total:    total,
+		PerPage:  perPage,
+		Prev:     page - 1,
+		Next:     page + 1,
+		HasPrev:  page > 1,
+		HasNext:  page < pages,
+	}
 
-	funcs := template.FuncMap{"n": groupThousands}
+	funcs := template.FuncMap{"n": groupThousands, "u": url.QueryEscape}
 	tmpl := template.Must(template.New("dash").Funcs(funcs).Parse(dashboardHTML))
-	tmpl.Execute(w, data)
+	if err := tmpl.Execute(w, data); err != nil {
+		log.Printf("template: %v", err)
+	}
 }
 
-const dashboardHTML = `
-<html>
+const dashboardHTML = `<html>
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
@@ -297,9 +362,10 @@ const dashboardHTML = `
 		.dev { color: #8a8a94; font-size: 11px; margin-top: 2px; }
 		.u { font-size: 12.5px; line-height: 1.55; white-space: nowrap; }
 		.uk { display: inline-block; width: 44px; color: #9a9aa4; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
-		input[type=text] { padding: 6px 8px; border: 1px solid #d5d5dd; border-radius: 5px; font-size: 13px; }
+		input[type=text], input[type=number] { padding: 6px 8px; border: 1px solid #d5d5dd; border-radius: 5px; font-size: 13px; }
 		.namebox { width: 130px; }
-		.search { width: 280px; }
+		.search { width: 240px; }
+		.pageno { width: 62px; }
 		button { padding: 6px 11px; border: 0; border-radius: 5px; cursor: pointer; font-size: 12.5px; }
 		.save { background: #2b2b33; color: #fff; }
 		.revoke { background: #b3261e; color: #fff; }
@@ -309,11 +375,20 @@ const dashboardHTML = `
 		form.inline { display: inline; margin: 0; }
 		td.mono { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
 
+		.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+		.pager { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0; font-size: 13px; }
+		.pager a, .pager .off { padding: 6px 12px; border-radius: 6px; border: 1px solid #d5d5dd; background: #fff; color: #2b2b33; text-decoration: none; }
+		.pager a:hover { background: #ececf1; }
+		.pager .off { color: #b9b9c2; background: #f7f7fa; }
+		.pager .count { color: #6b6b75; }
+		.pager form { display: inline-flex; gap: 6px; align-items: center; margin: 0; }
+
 		/* ---------- phone layout: each key becomes a compact card ---------- */
 		@media (max-width: 820px) {
 			body { padding: 10px; }
 			h2 { font-size: 18px; }
 			.topbar { margin-bottom: 8px; }
+			.toolbar { gap: 6px; }
 			.search { width: 100%; }
 			table, tbody, tr, td { display: block; width: 100%; }
 			table { box-shadow: none; background: transparent; border-radius: 0; }
@@ -333,6 +408,7 @@ const dashboardHTML = `
 			td[data-label="Usage"] { padding-left: 0; }
 			td[data-label="Action"] { padding-top: 6px; }
 			td[data-label="Action"]::before { vertical-align: middle; }
+			.pager { justify-content: center; }
 		}
 	</style>
 </head>
@@ -342,7 +418,25 @@ const dashboardHTML = `
 		<form action="/logout" method="POST"><button class="logout" type="submit">Logout</button></form>
 	</div>
 	{{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
-	<input class="search" type="text" id="search" oninput="onSearchInput()" placeholder="Search user, key or device...">
+
+	<form method="GET" action="/" class="toolbar">
+		<input class="search" type="text" name="q" value="{{.Q}}" placeholder="Search user, key or device...">
+		<button class="save" type="submit">Search</button>
+		{{if .Q}}<a href="/" style="font-size:13px;color:#b3261e;text-decoration:none;">clear</a>{{end}}
+		<span class="count" style="color:#6b6b75;font-size:12.5px;">{{.Total}} key{{if ne .Total 1}}s{{end}}{{if .Q}} matching &#8220;{{.Q}}&#8221;{{end}}</span>
+	</form>
+
+	<div class="pager">
+		{{if .HasPrev}}<a href="/?q={{u .Q}}&page={{.Prev}}">&#171; Back</a>{{else}}<span class="off">&#171; Back</span>{{end}}
+		<span class="count">Page {{.Page}} of {{.Pages}}</span>
+		{{if .HasNext}}<a href="/?q={{u .Q}}&page={{.Next}}">Next &#187;</a>{{else}}<span class="off">Next &#187;</span>{{end}}
+		<form method="GET" action="/">
+			<input type="hidden" name="q" value="{{.Q}}">
+			<input class="pageno" type="number" name="page" min="1" max="{{.Pages}}" value="{{.Page}}" aria-label="page">
+			<button class="save" type="submit">Go</button>
+		</form>
+	</div>
+
 	<table id="keyTable">
 		<tr><th style="width:20%">User</th><th style="width:24%">License Key</th><th style="width:18%">Status</th>{{if .HasUsage}}<th style="width:26%">Usage</th>{{end}}<th style="width:12%">Action</th></tr>
 		{{range .Rows}}
@@ -371,11 +465,15 @@ const dashboardHTML = `
 				{{if .Revoked}}
 					<form class="inline" action="/restore" method="POST">
 						<input type="hidden" name="key" value="{{.Key}}">
+						<input type="hidden" name="page" value="{{$.Page}}">
+						<input type="hidden" name="q" value="{{$.Q}}">
 						<button class="restore" type="submit">Restore</button>
 					</form>
 				{{else}}
 					<form class="inline" action="/revoke" method="POST">
 						<input type="hidden" name="key" value="{{.Key}}">
+						<input type="hidden" name="page" value="{{$.Page}}">
+						<input type="hidden" name="q" value="{{$.Q}}">
 						<button class="revoke" type="submit">Revoke</button>
 					</form>
 				{{end}}
@@ -383,9 +481,16 @@ const dashboardHTML = `
 		</tr>
 		{{end}}
 	</table>
+
+	<div class="pager">
+		{{if .HasPrev}}<a href="/?q={{u .Q}}&page={{.Prev}}">&#171; Back</a>{{else}}<span class="off">&#171; Back</span>{{end}}
+		<span class="count">Page {{.Page}} of {{.Pages}} &#183; {{.Total}} key{{if ne .Total 1}}s{{end}}</span>
+		{{if .HasNext}}<a href="/?q={{u .Q}}&page={{.Next}}">Next &#187;</a>{{else}}<span class="off">Next &#187;</span>{{end}}
+	</div>
+
 	<script>
 		// Save a name without reloading the page. A normal form POST reloads the
-		// whole table and throws you back to the top, thousands of rows away.
+		// table and throws you back to the top of the list.
 		document.addEventListener('submit', function (e) {
 			var f = e.target;
 			if (!f || !f.classList || !f.classList.contains('setname')) return;
@@ -405,7 +510,6 @@ const dashboardHTML = `
 					}
 					if (!resp.ok && resp.status !== 204) throw new Error('http ' + resp.status);
 					btn.textContent = 'Saved';
-					searchIndex = null;   // the name changed - rebuild the search index
 					setTimeout(function () { btn.textContent = label; btn.disabled = false; }, 1200);
 				})
 				.catch(function () {
@@ -413,39 +517,10 @@ const dashboardHTML = `
 					btn.disabled = false;
 				});
 		});
-
-		var searchIndex = null;
-		var searchTimer = null;
-
-		// Build the searchable text once per page load. Names live in input
-		// values, so textContent alone can never match a user name.
-		function buildSearchIndex() {
-			var tr = document.getElementById("keyTable").getElementsByTagName("tr");
-			searchIndex = [];
-			for (var i = 1; i < tr.length; i++) {
-				var row = tr[i];
-				var owner = row.querySelector('input[name="name"]');
-				var text = (row.textContent || row.innerText) + " " + (owner ? owner.value : "");
-				searchIndex.push({ el: row, t: text.toUpperCase() });
-			}
-		}
-
-		function filterTable() {
-			if (!searchIndex) buildSearchIndex();
-			var f = document.getElementById("search").value.toUpperCase();
-			for (var i = 0; i < searchIndex.length; i++) {
-				searchIndex[i].el.style.display = searchIndex[i].t.indexOf(f) > -1 ? "" : "none";
-			}
-		}
-
-		// Wait for a pause in typing instead of filtering on every keystroke.
-		function onSearchInput() {
-			clearTimeout(searchTimer);
-			searchTimer = setTimeout(filterTable, 150);
-		}
 	</script>
 </body>
-</html>`
+</html>
+`
 
 // ==========================================
 // LOGIN / LOGOUT
@@ -518,6 +593,27 @@ func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// backTo builds the dashboard URL to return to after an action, keeping the
+// search and the page the user was on.
+func backTo(r *http.Request, msg string) string {
+	q := strings.TrimSpace(r.FormValue("q"))
+	page := strings.TrimSpace(r.FormValue("page"))
+	v := url.Values{}
+	if q != "" {
+		v.Set("q", q)
+	}
+	if page != "" && page != "1" && page != "0" {
+		v.Set("page", page)
+	}
+	if msg != "" {
+		v.Set("msg", msg)
+	}
+	if len(v) == 0 {
+		return "/"
+	}
+	return "/?" + v.Encode()
+}
+
 func handleSetName(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
 		return
@@ -544,7 +640,7 @@ func handleSetName(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		msg = "Name cleared"
 	}
-	http.Redirect(w, r, "/?msg="+template.URLQueryEscaper(msg), http.StatusSeeOther)
+	http.Redirect(w, r, backTo(r, msg), http.StatusSeeOther)
 }
 
 func handleRevoke(w http.ResponseWriter, r *http.Request) {
@@ -563,7 +659,7 @@ func handleRevoke(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/?msg="+template.URLQueryEscaper("Key revoked - the bot will refuse to run"), http.StatusSeeOther)
+	http.Redirect(w, r, backTo(r, "Key revoked - the bot will refuse to run"), http.StatusSeeOther)
 }
 
 func handleRestore(w http.ResponseWriter, r *http.Request) {
@@ -581,7 +677,7 @@ func handleRestore(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/?msg="+template.URLQueryEscaper("Key restored"), http.StatusSeeOther)
+	http.Redirect(w, r, backTo(r, "Key restored"), http.StatusSeeOther)
 }
 
 // ==========================================
