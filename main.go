@@ -147,6 +147,7 @@ type KeyRow struct {
 	RunsMonth   int
 	AcctsMonth  int
 	LastRun     string
+	Activated   string
 }
 
 // groupThousands renders 1240 as 1,240 for the dashboard.
@@ -167,6 +168,9 @@ func groupThousands(n int) string {
 
 func humanAgo(t time.Time) string {
 	d := time.Since(t)
+	if d < 0 {
+		d = 0
+	}
 	switch {
 	case d < time.Minute:
 		return "just now"
@@ -174,8 +178,14 @@ func humanAgo(t time.Time) string {
 		return fmt.Sprintf("%dm ago", int(d.Minutes()))
 	case d < 24*time.Hour:
 		return fmt.Sprintf("%dh ago", int(d.Hours()))
-	default:
+	case d < 7*24*time.Hour:
 		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	case d < 30*24*time.Hour:
+		return fmt.Sprintf("%dw ago", int(d.Hours()/(24*7)))
+	case d < 365*24*time.Hour:
+		return fmt.Sprintf("%dmo ago", int(d.Hours()/(24*30)))
+	default:
+		return fmt.Sprintf("%dy ago", int(d.Hours()/(24*365)))
 	}
 }
 
@@ -186,6 +196,13 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	filter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("f")))
+	switch filter {
+	case "used", "unused", "revoked":
+	default:
+		filter = "all"
+	}
+
 	page := 1
 	if v, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && v > 0 {
 		page = v
@@ -193,18 +210,45 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	perPage := 50
 	like := "%" + q + "%"
 
+	// status filter and search share the same WHERE, so the paging and the
+	// counter always agree with what is on screen
+	filterSQL := ""
+	switch filter {
+	case "used":
+		filterSQL = " AND l.device_id IS NOT NULL AND COALESCE(l.revoked, false) = false"
+	case "unused":
+		filterSQL = " AND l.device_id IS NULL AND COALESCE(l.revoked, false) = false"
+	case "revoked":
+		filterSQL = " AND COALESCE(l.revoked, false) = true"
+	}
+
 	ctx := context.Background()
 
-	// how many keys match the search - needed for the page count
-	var total int
+	// one query gives the counts for all four tabs
+	var cAll, cUsed, cUnused, cRevoked int
 	if err := db.QueryRow(ctx,
-		`SELECT count(*) FROM licenses l
+		`SELECT count(*) AS all_keys,
+		        count(*) FILTER (WHERE device_id IS NOT NULL AND COALESCE(revoked, false) = false) AS used_keys,
+		        count(*) FILTER (WHERE device_id IS NULL AND COALESCE(revoked, false) = false) AS unused_keys,
+		        count(*) FILTER (WHERE COALESCE(revoked, false)) AS revoked_keys
+		   FROM licenses
 		  WHERE $1 = '%%'
-		     OR l.license_key ILIKE $1
-		     OR COALESCE(l.owner_name, '') ILIKE $1
-		     OR COALESCE(l.device_id, '') ILIKE $1`, like).Scan(&total); err != nil {
+		     OR license_key ILIKE $1
+		     OR COALESCE(owner_name, '') ILIKE $1
+		     OR COALESCE(device_id, '') ILIKE $1`, like).
+		Scan(&cAll, &cUsed, &cUnused, &cRevoked); err != nil {
 		http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	total := cAll
+	switch filter {
+	case "used":
+		total = cUsed
+	case "unused":
+		total = cUnused
+	case "revoked":
+		total = cRevoked
 	}
 
 	pages := (total + perPage - 1) / perPage
@@ -216,14 +260,13 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	offset := (page - 1) * perPage
 
-	// usage is stored one row per key per day, so day / week / month are three
-	// filters over the same rows. Nothing is reset or overwritten.
 	hasUsage := true
 	rows, err := db.Query(ctx,
 		`SELECT l.license_key,
 		        COALESCE(l.owner_name, ''),
 		        COALESCE(l.device_id, ''),
 		        COALESCE(l.revoked, false),
+		        l.activated_at,
 		        COALESCE(u.d_runs, 0),  COALESCE(u.d_acc, 0),
 		        COALESCE(u.w_runs, 0),  COALESCE(u.w_acc, 0),
 		        COALESCE(u.m_runs, 0),  COALESCE(u.m_acc, 0),
@@ -241,14 +284,15 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		          FROM usage
 		         GROUP BY license_key
 		   ) u ON u.license_key = l.license_key
-		  WHERE $1 = '%%'
+		  WHERE ($1 = '%%'
 		     OR l.license_key ILIKE $1
 		     OR COALESCE(l.owner_name, '') ILIKE $1
-		     OR COALESCE(l.device_id, '') ILIKE $1
+		     OR COALESCE(l.device_id, '') ILIKE $1)`+filterSQL+`
 		  ORDER BY COALESCE(l.revoked, false) ASC,
+		           COALESCE(u.m_acc, 0) DESC,
 		           COALESCE(u.m_runs, 0) DESC,
+		           COALESCE(u.w_acc, 0) DESC,
 		           COALESCE(u.w_runs, 0) DESC,
-		           COALESCE(u.d_runs, 0) DESC,
 		           COALESCE(l.owner_name, 'zzzz') ASC,
 		           l.license_key ASC
 		  LIMIT $2 OFFSET $3`, like, perPage, offset)
@@ -258,15 +302,16 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 			`SELECT license_key,
 			        COALESCE(owner_name, ''),
 			        COALESCE(device_id, ''),
-			        COALESCE(revoked, false)
-			   FROM licenses
-			  WHERE $1 = '%%'
-			     OR license_key ILIKE $1
-			     OR COALESCE(owner_name, '') ILIKE $1
-			     OR COALESCE(device_id, '') ILIKE $1
-			  ORDER BY COALESCE(revoked, false) ASC,
-			           COALESCE(owner_name, 'zzzz') ASC,
-			           license_key ASC
+			        COALESCE(revoked, false),
+			        activated_at
+			   FROM licenses l
+			  WHERE ($1 = '%%'
+			     OR l.license_key ILIKE $1
+			     OR COALESCE(l.owner_name, '') ILIKE $1
+			     OR COALESCE(l.device_id, '') ILIKE $1)`+filterSQL+`
+			  ORDER BY COALESCE(l.revoked, false) ASC,
+			           COALESCE(l.owner_name, 'zzzz') ASC,
+			           l.license_key ASC
 			  LIMIT $2 OFFSET $3`, like, perPage, offset)
 	}
 	if err != nil {
@@ -279,21 +324,26 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var k KeyRow
 		var last *time.Time
+		var activated *time.Time
 		ok := false
 		if hasUsage {
 			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked,
+				&activated,
 				&k.RunsToday, &k.AcctsToday,
 				&k.RunsWeek, &k.AcctsWeek,
 				&k.RunsMonth, &k.AcctsMonth,
 				&last) == nil
 		} else {
-			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked) == nil
+			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked, &activated) == nil
 		}
 		if !ok {
 			continue
 		}
 		if last != nil {
 			k.LastRun = humanAgo(*last)
+		}
+		if activated != nil {
+			k.Activated = humanAgo(*activated)
 		}
 		switch {
 		case k.Revoked:
@@ -307,31 +357,41 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := struct {
-		Rows     []KeyRow
-		Flash    string
-		HasUsage bool
-		Q        string
-		Page     int
-		Pages    int
-		Total    int
-		PerPage  int
-		Prev     int
-		Next     int
-		HasPrev  bool
-		HasNext  bool
+		Rows         []KeyRow
+		Flash        string
+		HasUsage     bool
+		Q            string
+		Filter       string
+		Page         int
+		Pages        int
+		Total        int
+		PerPage      int
+		Prev         int
+		Next         int
+		HasPrev      bool
+		HasNext      bool
+		AllCount     int
+		UsedCount    int
+		UnusedCount  int
+		RevokedCount int
 	}{
-		Rows:     keys,
-		Flash:    r.URL.Query().Get("msg"),
-		HasUsage: hasUsage,
-		Q:        q,
-		Page:     page,
-		Pages:    pages,
-		Total:    total,
-		PerPage:  perPage,
-		Prev:     page - 1,
-		Next:     page + 1,
-		HasPrev:  page > 1,
-		HasNext:  page < pages,
+		Rows:         keys,
+		Flash:        r.URL.Query().Get("msg"),
+		HasUsage:     hasUsage,
+		Q:            q,
+		Filter:       filter,
+		Page:         page,
+		Pages:        pages,
+		Total:        total,
+		PerPage:      perPage,
+		Prev:         page - 1,
+		Next:         page + 1,
+		HasPrev:      page > 1,
+		HasNext:      page < pages,
+		AllCount:     cAll,
+		UsedCount:    cUsed,
+		UnusedCount:  cUnused,
+		RevokedCount: cRevoked,
 	}
 
 	funcs := template.FuncMap{"n": groupThousands, "u": url.QueryEscape}
@@ -377,6 +437,11 @@ const dashboardHTML = `<html>
 
 		.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 		.pager { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0; font-size: 13px; }
+		.filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+		.filters .f { padding: 6px 12px; border: 1px solid #d5d5dd; border-radius: 6px; background: #fff; color: #2b2b33; text-decoration: none; font-size: 13px; }
+		.filters .f span { color: #9a9aa4; font-size: 11.5px; margin-left: 4px; }
+		.filters .f.on { background: #2b2b33; color: #fff; border-color: #2b2b33; }
+		.filters .f.on span { color: #c9c9d2; }
 		.pager a, .pager .off { padding: 6px 12px; border-radius: 6px; border: 1px solid #d5d5dd; background: #fff; color: #2b2b33; text-decoration: none; }
 		.pager a:hover { background: #ececf1; }
 		.pager .off { color: #b9b9c2; background: #f7f7fa; }
@@ -423,15 +488,23 @@ const dashboardHTML = `<html>
 		<input class="search" type="text" name="q" value="{{.Q}}" placeholder="Search user, key or device...">
 		<button class="save" type="submit">Search</button>
 		{{if .Q}}<a href="/" style="font-size:13px;color:#b3261e;text-decoration:none;">clear</a>{{end}}
-		<span class="count" style="color:#6b6b75;font-size:12.5px;">{{.Total}} key{{if ne .Total 1}}s{{end}}{{if .Q}} matching &#8220;{{.Q}}&#8221;{{end}}</span>
+		<span class="count" style="color:#6b6b75;font-size:12.5px;">{{.Total}} key{{if ne .Total 1}}s{{end}}{{if .Q}} matching &#8220;{{.Q}}&#8221;{{end}} &#183; ranked by accounts this month</span>
 	</form>
 
+	<div class="filters">
+		<a class="f{{if eq .Filter "all"}} on{{end}}" href="/?f=all&q={{u .Q}}">All <span>{{.AllCount}}</span></a>
+		<a class="f{{if eq .Filter "used"}} on{{end}}" href="/?f=used&q={{u .Q}}">Used <span>{{.UsedCount}}</span></a>
+		<a class="f{{if eq .Filter "unused"}} on{{end}}" href="/?f=unused&q={{u .Q}}">Unused <span>{{.UnusedCount}}</span></a>
+		<a class="f{{if eq .Filter "revoked"}} on{{end}}" href="/?f=revoked&q={{u .Q}}">Revoked <span>{{.RevokedCount}}</span></a>
+	</div>
+
 	<div class="pager">
-		{{if .HasPrev}}<a href="/?q={{u .Q}}&page={{.Prev}}">&#171; Back</a>{{else}}<span class="off">&#171; Back</span>{{end}}
+		{{if .HasPrev}}<a href="/?f={{.Filter}}&q={{u .Q}}&page={{.Prev}}">&#171; Back</a>{{else}}<span class="off">&#171; Back</span>{{end}}
 		<span class="count">Page {{.Page}} of {{.Pages}}</span>
-		{{if .HasNext}}<a href="/?q={{u .Q}}&page={{.Next}}">Next &#187;</a>{{else}}<span class="off">Next &#187;</span>{{end}}
+		{{if .HasNext}}<a href="/?f={{.Filter}}&q={{u .Q}}&page={{.Next}}">Next &#187;</a>{{else}}<span class="off">Next &#187;</span>{{end}}
 		<form method="GET" action="/">
 			<input type="hidden" name="q" value="{{.Q}}">
+			<input type="hidden" name="f" value="{{.Filter}}">
 			<input class="pageno" type="number" name="page" min="1" max="{{.Pages}}" value="{{.Page}}" aria-label="page">
 			<button class="save" type="submit">Go</button>
 		</form>
@@ -452,6 +525,7 @@ const dashboardHTML = `<html>
 			<td data-label="Status">
 				<span class="badge {{.StatusClass}}">{{.Status}}</span>
 				{{if .Device}}<div class="dev">{{.Device}}</div>{{end}}
+				{{if .Activated}}<div class="dev">activated {{.Activated}}</div>{{end}}
 			</td>
 			{{if $.HasUsage}}
 			<td data-label="Usage">
@@ -483,9 +557,9 @@ const dashboardHTML = `<html>
 	</table>
 
 	<div class="pager">
-		{{if .HasPrev}}<a href="/?q={{u .Q}}&page={{.Prev}}">&#171; Back</a>{{else}}<span class="off">&#171; Back</span>{{end}}
+		{{if .HasPrev}}<a href="/?f={{.Filter}}&q={{u .Q}}&page={{.Prev}}">&#171; Back</a>{{else}}<span class="off">&#171; Back</span>{{end}}
 		<span class="count">Page {{.Page}} of {{.Pages}} &#183; {{.Total}} key{{if ne .Total 1}}s{{end}}</span>
-		{{if .HasNext}}<a href="/?q={{u .Q}}&page={{.Next}}">Next &#187;</a>{{else}}<span class="off">Next &#187;</span>{{end}}
+		{{if .HasNext}}<a href="/?f={{.Filter}}&q={{u .Q}}&page={{.Next}}">Next &#187;</a>{{else}}<span class="off">Next &#187;</span>{{end}}
 	</div>
 
 	<script>
