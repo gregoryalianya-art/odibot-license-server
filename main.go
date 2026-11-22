@@ -274,14 +274,14 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		   FROM licenses l
 		   LEFT JOIN (
 		        SELECT license_key,
-		               SUM(runs)     FILTER (WHERE day = (now() AT TIME ZONE 'Africa/Nairobi')::date) AS d_runs,
-		               SUM(accounts) FILTER (WHERE day = (now() AT TIME ZONE 'Africa/Nairobi')::date) AS d_acc,
-		               SUM(runs)     FILTER (WHERE day >= date_trunc('week',  (now() AT TIME ZONE 'Africa/Nairobi')::date)) AS w_runs,
-		               SUM(accounts) FILTER (WHERE day >= date_trunc('week',  (now() AT TIME ZONE 'Africa/Nairobi')::date)) AS w_acc,
-		               SUM(runs)     FILTER (WHERE day >= date_trunc('month', (now() AT TIME ZONE 'Africa/Nairobi')::date)) AS m_runs,
-		               SUM(accounts) FILTER (WHERE day >= date_trunc('month', (now() AT TIME ZONE 'Africa/Nairobi')::date)) AS m_acc,
-		               MAX(last_run_at) AS last_run
-		          FROM usage
+		               COUNT(*)      FILTER (WHERE at >= now() - interval '24 hours') AS d_runs,
+		               SUM(accounts) FILTER (WHERE at >= now() - interval '24 hours') AS d_acc,
+		               COUNT(*)      FILTER (WHERE at >= now() - interval '7 days')   AS w_runs,
+		               SUM(accounts) FILTER (WHERE at >= now() - interval '7 days')   AS w_acc,
+		               COUNT(*)      FILTER (WHERE at >= now() - interval '30 days')  AS m_runs,
+		               SUM(accounts) FILTER (WHERE at >= now() - interval '30 days')  AS m_acc,
+		               MAX(at) AS last_run
+		          FROM runs
 		         GROUP BY license_key
 		   ) u ON u.license_key = l.license_key
 		  WHERE ($1 = '%%'
@@ -529,9 +529,9 @@ const dashboardHTML = `<html>
 			</td>
 			{{if $.HasUsage}}
 			<td data-label="Usage">
-				<div class="u"><span class="uk">Day</span>{{if .RunsToday}}{{.RunsToday}} run{{if ne .RunsToday 1}}s{{end}} · {{n .AcctsToday}} acc{{else}}—{{end}}</div>
-				<div class="u"><span class="uk">Week</span>{{if .RunsWeek}}{{.RunsWeek}} runs · {{n .AcctsWeek}} acc{{else}}—{{end}}</div>
-				<div class="u"><span class="uk">Month</span>{{if .RunsMonth}}{{.RunsMonth}} runs · {{n .AcctsMonth}} acc{{else}}—{{end}}</div>
+				<div class="u"><span class="uk">24H</span>{{if .RunsToday}}{{.RunsToday}} run{{if ne .RunsToday 1}}s{{end}} · {{n .AcctsToday}} acc{{else}}—{{end}}</div>
+				<div class="u"><span class="uk">7D</span>{{if .RunsWeek}}{{.RunsWeek}} runs · {{n .AcctsWeek}} acc{{else}}—{{end}}</div>
+				<div class="u"><span class="uk">30D</span>{{if .RunsMonth}}{{.RunsMonth}} runs · {{n .AcctsMonth}} acc{{else}}—{{end}}</div>
 				{{if .LastRun}}<div class="dev">{{.LastRun}}</div>{{end}}
 			</td>
 			{{end}}
@@ -933,6 +933,16 @@ func handleUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// one row per run, with a real timestamp - this is what the rolling
+	// 24h / 7d / 30d windows read
+	if _, err := db.Exec(ctx,
+		`INSERT INTO runs (license_key, at, accounts) VALUES ($1, NOW(), $2)`,
+		req.Key, req.Accounts); err != nil {
+		writeJSON(w, http.StatusInternalServerError, ActivationResponse{Status: "error", Error: "runs table missing? Run runs.sql."})
+		return
+	}
+
+	// keep the daily table too, so history and any old query keep working
 	_, err = db.Exec(ctx,
 		`INSERT INTO usage (license_key, day, runs, accounts)
 		 VALUES ($1, (now() AT TIME ZONE 'Africa/Nairobi')::date, 1, $2)
