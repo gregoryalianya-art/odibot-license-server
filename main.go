@@ -134,20 +134,21 @@ func validSession(r *http.Request) bool {
 // DASHBOARD
 // ==========================================
 type KeyRow struct {
-	Key         string
-	Owner       string
-	Device      string
-	Revoked     bool
-	Status      string
-	StatusClass string
-	RunsToday   int
-	AcctsToday  int
-	RunsWeek    int
-	AcctsWeek   int
-	RunsMonth   int
-	AcctsMonth  int
-	LastRun     string
-	Activated   string
+	Key           string
+	Owner         string
+	Device        string
+	Revoked       bool
+	Status        string
+	StatusClass   string
+	RunsToday     int
+	AcctsToday    int
+	RunsWeek      int
+	AcctsWeek     int
+	RunsMonth     int
+	AcctsMonth    int
+	LastRun       string
+	Activated     string
+	HasActivation bool
 }
 
 // groupThousands renders 1240 as 1,240 for the dashboard.
@@ -215,9 +216,9 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	filterSQL := ""
 	switch filter {
 	case "used":
-		filterSQL = " AND l.device_id IS NOT NULL AND COALESCE(l.revoked, false) = false"
+		filterSQL = " AND (l.device_id IS NOT NULL OR l.activated_at IS NOT NULL) AND COALESCE(l.revoked, false) = false"
 	case "unused":
-		filterSQL = " AND l.device_id IS NULL AND COALESCE(l.revoked, false) = false"
+		filterSQL = " AND l.device_id IS NULL AND l.activated_at IS NULL AND COALESCE(l.revoked, false) = false"
 	case "revoked":
 		filterSQL = " AND COALESCE(l.revoked, false) = true"
 	}
@@ -228,8 +229,8 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	var cAll, cUsed, cUnused, cRevoked int
 	if err := db.QueryRow(ctx,
 		`SELECT count(*) AS all_keys,
-		        count(*) FILTER (WHERE device_id IS NOT NULL AND COALESCE(revoked, false) = false) AS used_keys,
-		        count(*) FILTER (WHERE device_id IS NULL AND COALESCE(revoked, false) = false) AS unused_keys,
+		        count(*) FILTER (WHERE (device_id IS NOT NULL OR activated_at IS NOT NULL) AND COALESCE(revoked, false) = false) AS used_keys,
+		        count(*) FILTER (WHERE device_id IS NULL AND activated_at IS NULL AND COALESCE(revoked, false) = false) AS unused_keys,
 		        count(*) FILTER (WHERE COALESCE(revoked, false)) AS revoked_keys
 		   FROM licenses
 		  WHERE $1 = '%%'
@@ -344,6 +345,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		if activated != nil {
 			k.Activated = humanAgo(*activated)
+			k.HasActivation = true
 		}
 		switch {
 		case k.Revoked:
@@ -351,6 +353,8 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		case k.Device != "":
 			k.Status, k.StatusClass = "Used", "used"
 		default:
+			// no device means the key is still free, whatever old timestamp it
+			// may carry - a real activation always writes the device too
 			k.Status, k.StatusClass = "Available", "avail"
 		}
 		keys = append(keys, k)
@@ -525,7 +529,7 @@ const dashboardHTML = `<html>
 			<td data-label="Status">
 				<span class="badge {{.StatusClass}}">{{.Status}}</span>
 				{{if .Device}}<div class="dev">{{.Device}}</div>{{end}}
-				{{if .Activated}}<div class="dev">activated {{.Activated}}</div>{{end}}
+				{{if .Activated}}{{if .Device}}<div class="dev">activated {{.Activated}}</div>{{else}}<div class="dev">old attempt {{.Activated}} &#8212; no device recorded</div>{{end}}{{end}}
 			</td>
 			{{if $.HasUsage}}
 			<td data-label="Usage">
