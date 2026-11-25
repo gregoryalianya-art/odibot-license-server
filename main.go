@@ -452,32 +452,61 @@ const dashboardHTML = `<html>
 		.pager .count { color: #6b6b75; }
 		.pager form { display: inline-flex; gap: 6px; align-items: center; margin: 0; }
 
-		/* ---------- phone layout: each key becomes a compact card ---------- */
+		.u3 { display: block; }
+		.u3 .cell { display: block; font-size: 12.5px; line-height: 1.55; white-space: nowrap; }
+		.u3 .v { color: #2b2b33; }
+
+		/* ---------- phone layout: compact card, 3 columns of usage ---------- */
 		@media (max-width: 820px) {
-			body { padding: 10px; }
-			h2 { font-size: 18px; }
-			.topbar { margin-bottom: 8px; }
-			.toolbar { gap: 6px; }
+			body { padding: 8px; }
+			h2 { font-size: 17px; }
+			.topbar { margin-bottom: 6px; }
+			.toolbar { gap: 6px; margin-bottom: 8px; }
+			.filters { gap: 6px; margin-bottom: 8px; }
+			.filters .f { padding: 5px 10px; font-size: 12.5px; }
 			.search { width: 100%; }
 			table, tbody, tr, td { display: block; width: 100%; }
 			table { box-shadow: none; background: transparent; border-radius: 0; }
 			thead, tr:first-child { display: none; }
-			tr { background: #fff; border: 1px solid #e4e4ea; border-radius: 8px; margin-bottom: 8px; padding: 8px 10px; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
-			td { border: 0; padding: 3px 0; font-size: 13px; }
-			td::before {
-				content: attr(data-label);
-				display: inline-block; width: 46px;
-				color: #9a9aa4; font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px;
-				vertical-align: top;
+
+			tr {
+				display: grid;
+				grid-template-columns: 1fr auto;
+				column-gap: 8px;
+				background: #fff; border: 1px solid #e4e4ea; border-radius: 8px;
+				margin-bottom: 8px; padding: 8px 10px 9px;
+				box-shadow: 0 1px 2px rgba(0,0,0,.05);
 			}
-			td.mono { word-break: break-all; line-height: 1.35; }
-			.namebox { width: calc(100% - 112px); }
-			td[data-label="User"]::before { vertical-align: middle; }
-			td[data-label="Usage"]::before { display: none; }
-			td[data-label="Usage"] { padding-left: 0; }
-			td[data-label="Action"] { padding-top: 6px; }
-			td[data-label="Action"]::before { vertical-align: middle; }
-			.pager { justify-content: center; }
+			td { border: 0; padding: 0; font-size: 13px; }
+			td::before { display: none; }
+
+			/* 1: name + save */
+			td[data-label="User"] { grid-column: 1 / 3; }
+			td[data-label="User"] form { display: flex; gap: 6px; }
+			.namebox { width: 100%; padding: 6px 9px; font-size: 13.5px; }
+			td[data-label="User"] .save { padding: 6px 13px; }
+
+			/* 2: key */
+			td.mono { grid-column: 1 / 3; font-size: 11.5px; line-height: 1.25; color: #4a4a55; margin-top: 2px; word-break: break-all; }
+
+			/* 3: status + last run, revoke on the right */
+			td[data-label="Status"] { grid-column: 1; margin-top: 3px; }
+			td[data-label="Status"] .badge { font-size: 12.5px; }
+			td[data-label="Status"] .run { font-size: 10.5px; }
+			td[data-label="Status"] .guid { font-size: 9.5px; line-height: 1.2; margin-top: 1px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+			td[data-label="Action"] { grid-column: 2; grid-row: 3; align-self: start; justify-self: end; margin-top: 3px; }
+			td[data-label="Action"] .revoke,
+			td[data-label="Action"] .restore { padding: 4px 10px; font-size: 11.5px; }
+
+			/* 4: 24H / 7D / 30D on one row */
+			td[data-label="Usage"] { grid-column: 1 / 3; margin-top: 7px; padding-top: 7px; border-top: 1px solid #f0f0f4; }
+			td[data-label="Usage"] .u3 { display: block; }
+			td[data-label="Usage"] .u3 .cell { display: flex; align-items: baseline; gap: 6px; white-space: nowrap; line-height: 1.45; }
+			td[data-label="Usage"] .u3 .uk { width: 30px; font-size: 9.5px; flex: 0 0 30px; }
+			td[data-label="Usage"] .u3 .v { font-size: 11.5px; }
+
+			.pager { justify-content: center; gap: 6px; margin: 8px 0; }
+			.pager a, .pager .off { padding: 5px 10px; }
 		}
 	</style>
 </head>
@@ -527,16 +556,17 @@ const dashboardHTML = `<html>
 			</td>
 			<td class="mono" data-label="Key">{{.Key}}</td>
 			<td data-label="Status">
-				<span class="badge {{.StatusClass}}">{{.Status}}</span>
-				{{if .Device}}<div class="dev">{{.Device}}</div>{{end}}
-				{{if .Activated}}{{if .Device}}<div class="dev">activated {{.Activated}}</div>{{else}}<div class="dev">old attempt {{.Activated}} &#8212; no device recorded</div>{{end}}{{end}}
+				<span class="badge {{.StatusClass}}">{{.Status}}</span>{{if .LastRun}}<span class="dev run"> &#183; {{.LastRun}}</span>{{end}}
+				{{if .Device}}<div class="dev guid" title="{{.Device}}">{{if .Activated}}{{.Activated}} &#183; {{end}}{{.Device}}</div>{{end}}
+				{{if .Activated}}{{if not .Device}}<div class="dev">old attempt {{.Activated}} &#8212; no device recorded</div>{{end}}{{end}}
 			</td>
 			{{if $.HasUsage}}
-			<td data-label="Usage">
-				<div class="u"><span class="uk">24H</span>{{if .RunsToday}}{{.RunsToday}} run{{if ne .RunsToday 1}}s{{end}} · {{n .AcctsToday}} acc{{else}}—{{end}}</div>
-				<div class="u"><span class="uk">7D</span>{{if .RunsWeek}}{{.RunsWeek}} runs · {{n .AcctsWeek}} acc{{else}}—{{end}}</div>
-				<div class="u"><span class="uk">30D</span>{{if .RunsMonth}}{{.RunsMonth}} runs · {{n .AcctsMonth}} acc{{else}}—{{end}}</div>
-				{{if .LastRun}}<div class="dev">{{.LastRun}}</div>{{end}}
+						<td data-label="Usage">
+				<div class="u3">
+					<div class="cell"><span class="uk">24H</span><span class="v">{{if .RunsToday}}{{.RunsToday}} run{{if ne .RunsToday 1}}s{{end}} &#183; {{n .AcctsToday}} acc{{else}}&#8212;{{end}}</span></div>
+					<div class="cell"><span class="uk">7D</span><span class="v">{{if .RunsWeek}}{{.RunsWeek}} runs &#183; {{n .AcctsWeek}} acc{{else}}&#8212;{{end}}</span></div>
+					<div class="cell"><span class="uk">30D</span><span class="v">{{if .RunsMonth}}{{.RunsMonth}} runs &#183; {{n .AcctsMonth}} acc{{else}}&#8212;{{end}}</span></div>
+				</div>
 			</td>
 			{{end}}
 			<td data-label="Action">
