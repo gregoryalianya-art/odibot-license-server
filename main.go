@@ -298,7 +298,6 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		               SUM(accounts) FILTER (WHERE at >= now() - interval '7 days')   AS w_acc,
 		               COUNT(*)      FILTER (WHERE at >= now() - interval '30 days')  AS m_runs,
 		               SUM(accounts) FILTER (WHERE at >= now() - interval '30 days')  AS m_acc,
-		               SUM(accounts) AS total_acc,
 		               MAX(at) AS last_run
 		          FROM runs
 		         GROUP BY license_key
@@ -1112,7 +1111,12 @@ func handleSetCredits(w http.ResponseWriter, r *http.Request) {
 
 	n, err := strconv.Atoi(raw)
 	if err != nil || n < 0 {
-		http.Redirect(w, r, backTo(r, "Credits must be a number"), http.StatusSeeOther)
+		creditsReply(w, r, "Credits must be a number")
+		return
+	}
+	// acc_limit is a 32-bit column; anything larger would 500 on the database
+	if n > 1000000000 {
+		creditsReply(w, r, "That number is too large")
 		return
 	}
 	// zero means unlimited, the same as an empty box - store it that way so the
@@ -1126,10 +1130,15 @@ func handleSetCredits(w http.ResponseWriter, r *http.Request) {
 		creditsReply(w, r, "Credits removed - unlimited")
 		return
 	}
-	// a saved limit starts a fresh counting window: the customer paid for this
-	// batch, so previous usage must not count against it
+	// a *changed* limit starts a fresh counting window: the customer paid for
+	// this batch, so previous usage must not count against it. Saving the same
+	// number again must NOT reset anything - that would hand out free credits.
 	if _, err := db.Exec(context.Background(),
-		`UPDATE licenses SET acc_limit = $1, credit_reset_at = NOW() WHERE license_key = $2`, n, key); err != nil {
+		`UPDATE licenses
+		    SET acc_limit = $1,
+		        credit_reset_at = CASE WHEN acc_limit IS DISTINCT FROM $1::integer
+		                               THEN NOW() ELSE credit_reset_at END
+		  WHERE license_key = $2`, n, key); err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
@@ -1192,14 +1201,29 @@ func handleUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// credits: refuse the run outright when it would pass the allowance
+	// Everything below runs in ONE transaction with the licence row locked, so
+	// two windows on the same PC cannot both pass the credit check: the second
+	// waits for the first and then sees its usage.
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, ActivationResponse{Status: "error", Error: "Database error"})
+		return
+	}
+	defer tx.Rollback(ctx)
+
 	var accLimit *int
 	var resetAt *time.Time
-	_ = db.QueryRow(ctx, `SELECT acc_limit, credit_reset_at FROM licenses WHERE license_key = $1`, req.Key).Scan(&accLimit, &resetAt)
+	if err := tx.QueryRow(ctx,
+		`SELECT acc_limit, credit_reset_at FROM licenses WHERE license_key = $1 FOR UPDATE`,
+		req.Key).Scan(&accLimit, &resetAt); err != nil {
+		writeJSON(w, http.StatusInternalServerError, ActivationResponse{Status: "error", Error: "Database error"})
+		return
+	}
+
 	if accLimit != nil && *accLimit > 0 {
 		var used int
-		_ = db.QueryRow(ctx, `SELECT COALESCE(SUM(accounts), 0) FROM runs
-		                       WHERE license_key = $1 AND at >= COALESCE($2::timestamptz, '1970-01-01')`,
+		_ = tx.QueryRow(ctx, `SELECT COALESCE(SUM(accounts), 0) FROM runs
+		                      WHERE license_key = $1 AND at >= COALESCE($2::timestamptz, '1970-01-01')`,
 			req.Key, resetAt).Scan(&used)
 		// refuse only once the allowance is actually used up. While credits
 		// remain, any run is allowed - even one that overshoots the total.
@@ -1213,7 +1237,7 @@ func handleUsage(w http.ResponseWriter, r *http.Request) {
 
 	// one row per run, with a real timestamp - this is what the rolling
 	// 24h / 7d / 30d windows read
-	if _, err := db.Exec(ctx,
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO runs (license_key, at, accounts) VALUES ($1, NOW(), $2)`,
 		req.Key, req.Accounts); err != nil {
 		writeJSON(w, http.StatusInternalServerError, ActivationResponse{Status: "error", Error: "runs table missing? Run runs.sql."})
@@ -1221,15 +1245,19 @@ func handleUsage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// keep the daily table too, so history and any old query keep working
-	_, err = db.Exec(ctx,
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO usage (license_key, day, runs, accounts)
 		 VALUES ($1, (now() AT TIME ZONE 'Africa/Nairobi')::date, 1, $2)
 		 ON CONFLICT (license_key, day) DO UPDATE
 		    SET runs        = usage.runs + 1,
 		        accounts    = usage.accounts + EXCLUDED.accounts,
-		        last_run_at = NOW()`, req.Key, req.Accounts)
-	if err != nil {
+		        last_run_at = NOW()`, req.Key, req.Accounts); err != nil {
 		writeJSON(w, http.StatusInternalServerError, ActivationResponse{Status: "error", Error: "Usage table missing? Run the SQL."})
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		writeJSON(w, http.StatusInternalServerError, ActivationResponse{Status: "error", Error: "Database error"})
 		return
 	}
 
