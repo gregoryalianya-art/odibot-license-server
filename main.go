@@ -314,6 +314,8 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		           l.license_key ASC
 		  LIMIT $2 OFFSET $3`, like, perPage, offset)
 	if err != nil {
+		// fall back, but leave a trail: a schema drift must not look like an empty table
+		log.Printf("dashboard: usage query failed, falling back: %v", err)
 		hasUsage = false
 		rows, err = db.Query(ctx,
 			`SELECT license_key,
@@ -860,12 +862,24 @@ func handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 
 	ctx := context.Background()
 
-	// history first, so nothing is left pointing at a key that no longer exists
-	_, _ = db.Exec(ctx, `DELETE FROM runs WHERE license_key = $1`, key)
-	_, _ = db.Exec(ctx, `DELETE FROM usage WHERE license_key = $1`, key)
-
-	res, err := db.Exec(ctx, `DELETE FROM licenses WHERE license_key = $1`, key)
+	// all three deletes or none: a half-finished delete would leave history
+	// without its key, or a key without its history
+	tx, err := db.Begin(ctx)
 	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	_, _ = tx.Exec(ctx, `DELETE FROM runs WHERE license_key = $1`, key)
+	_, _ = tx.Exec(ctx, `DELETE FROM usage WHERE license_key = $1`, key)
+
+	res, err := tx.Exec(ctx, `DELETE FROM licenses WHERE license_key = $1`, key)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
