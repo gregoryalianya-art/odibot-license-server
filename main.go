@@ -285,6 +285,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		        COALESCE(u.d_runs, 0),  COALESCE(u.d_acc, 0),
 		        COALESCE(u.w_runs, 0),  COALESCE(u.w_acc, 0),
 		        COALESCE(u.m_runs, 0),  COALESCE(u.m_acc, 0),
+		        COALESCE(u.total_acc, 0),
 		        u.last_run
 		   FROM licenses l
 		   LEFT JOIN (
@@ -343,18 +344,20 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		var last *time.Time
 		var activated *time.Time
 		var accLimit *int
-		ok := false
+		var scanErr error
 		if hasUsage {
-			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked,
+			scanErr = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked,
 				&activated, &accLimit,
 				&k.RunsToday, &k.AcctsToday,
 				&k.RunsWeek, &k.AcctsWeek,
 				&k.RunsMonth, &k.AcctsMonth,
-				&k.UsedTotal, &last) == nil
+				&k.UsedTotal, &last)
 		} else {
-			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked, &activated, &accLimit) == nil
+			scanErr = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked, &activated, &accLimit)
 		}
-		if !ok {
+		if scanErr != nil {
+			// a column mismatch used to hide rows without a trace - log it instead
+			log.Printf("scan failed for %s: %v", k.Key, scanErr)
 			continue
 		}
 		if last != nil {
