@@ -1201,7 +1201,9 @@ func handleUsage(w http.ResponseWriter, r *http.Request) {
 		_ = db.QueryRow(ctx, `SELECT COALESCE(SUM(accounts), 0) FROM runs
 		                       WHERE license_key = $1 AND at >= COALESCE($2::timestamptz, '1970-01-01')`,
 			req.Key, resetAt).Scan(&used)
-		if used+req.Accounts > *accLimit {
+		// refuse only once the allowance is actually used up. While credits
+		// remain, any run is allowed - even one that overshoots the total.
+		if used >= *accLimit {
 			writeJSON(w, http.StatusPaymentRequired, ActivationResponse{
 				Status: "limit", Used: used, Limit: *accLimit, Error: "Account limit reached.",
 			})
