@@ -42,6 +42,8 @@ type ActivationResponse struct {
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
 	Token  string `json:"token,omitempty"`
+	Used   int    `json:"used,omitempty"`
+	Limit  int    `json:"limit,omitempty"`
 }
 
 func generateToken(deviceID string) string {
@@ -92,6 +94,8 @@ func main() {
 	http.HandleFunc("/activate", handleActivate)
 	http.HandleFunc("/verify", handleVerify)
 	http.HandleFunc("/usage", handleUsage)
+	http.HandleFunc("/quota", handleQuota)
+	http.HandleFunc("/set-credits", handleSetCredits)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -150,6 +154,8 @@ type KeyRow struct {
 	LastRun       string
 	Activated     string
 	HasActivation bool
+	Limit         *int
+	UsedTotal     int
 }
 
 // groupThousands renders 1240 as 1,240 for the dashboard.
@@ -192,6 +198,12 @@ func humanAgo(t time.Time) string {
 }
 
 func handleDashboard(w http.ResponseWriter, r *http.Request) {
+	// never let the browser or the CDN serve a cached dashboard: a pushed fix
+	// must show up on the next load, not after a hard refresh
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
 	if !validSession(r) {
 		showLoginPage(w, r.URL.Query().Get("error") == "1")
 		return
@@ -269,6 +281,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		        COALESCE(l.device_id, ''),
 		        COALESCE(l.revoked, false),
 		        l.activated_at,
+		        l.acc_limit,
 		        COALESCE(u.d_runs, 0),  COALESCE(u.d_acc, 0),
 		        COALESCE(u.w_runs, 0),  COALESCE(u.w_acc, 0),
 		        COALESCE(u.m_runs, 0),  COALESCE(u.m_acc, 0),
@@ -282,6 +295,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		               SUM(accounts) FILTER (WHERE at >= now() - interval '7 days')   AS w_acc,
 		               COUNT(*)      FILTER (WHERE at >= now() - interval '30 days')  AS m_runs,
 		               SUM(accounts) FILTER (WHERE at >= now() - interval '30 days')  AS m_acc,
+		               SUM(accounts) AS total_acc,
 		               MAX(at) AS last_run
 		          FROM runs
 		         GROUP BY license_key
@@ -305,7 +319,8 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 			        COALESCE(owner_name, ''),
 			        COALESCE(device_id, ''),
 			        COALESCE(revoked, false),
-			        activated_at
+			        activated_at,
+			        acc_limit
 			   FROM licenses l
 			  WHERE ($1 = '%%'
 			     OR l.license_key ILIKE $1
@@ -327,16 +342,17 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		var k KeyRow
 		var last *time.Time
 		var activated *time.Time
+		var accLimit *int
 		ok := false
 		if hasUsage {
 			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked,
-				&activated,
+				&activated, &accLimit,
 				&k.RunsToday, &k.AcctsToday,
 				&k.RunsWeek, &k.AcctsWeek,
 				&k.RunsMonth, &k.AcctsMonth,
-				&last) == nil
+				&k.UsedTotal, &last) == nil
 		} else {
-			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked, &activated) == nil
+			ok = rows.Scan(&k.Key, &k.Owner, &k.Device, &k.Revoked, &activated, &accLimit) == nil
 		}
 		if !ok {
 			continue
@@ -348,6 +364,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 			k.Activated = humanAgo(*activated)
 			k.HasActivation = true
 		}
+		k.Limit = accLimit
 		switch {
 		case k.Revoked:
 			k.Status, k.StatusClass = "Revoked", "revoked"
@@ -428,7 +445,12 @@ const dashboardHTML = `<html>
 		.u { font-size: 12.5px; line-height: 1.55; white-space: nowrap; }
 		.uk { display: inline-block; width: 44px; color: #9a9aa4; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
 		input[type=text], input[type=number] { padding: 6px 8px; border: 1px solid #d5d5dd; border-radius: 5px; font-size: 13px; }
-		.namebox { width: 130px; }
+		.namebox { width: 100%; }
+		.credbox { width: 100%; }
+		td[data-label="User"] form.setname, td[data-label="User"] form.creditsrow { display: flex !important; gap: 4px; align-items: center; }
+		td[data-label="User"] form.setname .save, td[data-label="User"] form.creditsrow .save { flex: 0 0 auto; }
+		form.creditsrow { margin-top: 4px; }
+		td[data-label="User"] .dev { margin-top: 3px; font-size: 10.5px; }
 		.search { width: 240px; }
 		.pageno { width: 62px; }
 		button { padding: 6px 11px; border: 0; border-radius: 5px; cursor: pointer; font-size: 12.5px; }
@@ -549,7 +571,7 @@ const dashboardHTML = `<html>
 	</div>
 
 	<table id="keyTable">
-		<tr><th style="width:20%">User</th><th style="width:24%">License Key</th><th style="width:18%">Status</th>{{if .HasUsage}}<th style="width:26%">Usage</th>{{end}}<th style="width:12%">Action</th></tr>
+		<tr><th style="width:23%">User</th><th style="width:21%">License Key</th><th style="width:18%">Status</th>{{if .HasUsage}}<th style="width:26%">Usage</th>{{end}}<th style="width:12%">Action</th></tr>
 		{{range .Rows}}
 		<tr>
 			<td data-label="User">
@@ -558,6 +580,15 @@ const dashboardHTML = `<html>
 					<input class="namebox" type="text" name="name" value="{{.Owner}}" placeholder="who is this?">
 					<button class="save" type="submit">Save</button>
 				</form>
+				<form class="inline creditsrow" action="/set-credits" method="POST">
+					<input type="hidden" name="key" value="{{.Key}}">
+					<input type="hidden" name="page" value="{{$.Page}}">
+					<input type="hidden" name="q" value="{{$.Q}}">
+					<input type="hidden" name="f" value="{{$.Filter}}">
+					<input class="credbox" type="number" min="0" name="limit" value="{{if .Limit}}{{.Limit}}{{end}}" placeholder="unlimited">
+					<button class="save" type="submit">Save</button>
+				</form>
+				<div class="dev">{{n .UsedTotal}} acc used{{if .Limit}} / {{n .Limit}}{{end}}</div>
 			</td>
 			<td class="mono" data-label="Key">{{.Key}}</td>
 			<td data-label="Status">
@@ -955,6 +986,108 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 // handleUsage is called ONCE per run, when the user presses Enter with the Excel loaded.
 // It records how many accounts were loaded. Same auth as /verify, so only the machine
 // that owns the key can write to that key's profile.
+// handleQuota tells the bot how many accounts the key has used and how many it
+// is allowed. Called at startup, before the menu, so an exhausted key stops there.
+func handleQuota(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Key      string `json:"key"`
+		DeviceID string `json:"device_id"`
+		Token    string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Key == "" || req.DeviceID == "" {
+		writeJSON(w, http.StatusBadRequest, ActivationResponse{Status: "invalid", Error: "key and device_id are required"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var device *string
+	var revoked bool
+	var limit *int
+	if err := db.QueryRow(ctx,
+		`SELECT device_id, COALESCE(revoked, false), acc_limit FROM licenses WHERE license_key = $1`, req.Key).
+		Scan(&device, &revoked, &limit); err != nil {
+		writeJSON(w, http.StatusForbidden, ActivationResponse{Status: "invalid", Error: "Invalid license key."})
+		return
+	}
+	if revoked {
+		writeJSON(w, http.StatusForbidden, ActivationResponse{Status: "revoked"})
+		return
+	}
+	if device == nil || *device != req.DeviceID {
+		writeJSON(w, http.StatusConflict, ActivationResponse{Status: "used"})
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(req.Token), []byte(generateToken(*device))) != 1 {
+		writeJSON(w, http.StatusForbidden, ActivationResponse{Status: "invalid"})
+		return
+	}
+
+	var used int
+	_ = db.QueryRow(ctx, `SELECT COALESCE(SUM(accounts), 0) FROM runs WHERE license_key = $1`, req.Key).Scan(&used)
+
+	lim := 0
+	if limit != nil {
+		lim = *limit
+	}
+	writeJSON(w, http.StatusOK, ActivationResponse{Status: "ok", Used: used, Limit: lim})
+}
+
+// handleSetCredits stores the allowance. Empty input means unlimited.
+func handleSetCredits(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	key := strings.TrimSpace(r.FormValue("key"))
+	if key == "" {
+		http.Redirect(w, r, "/?msg=Missing+key", http.StatusSeeOther)
+		return
+	}
+	raw := strings.TrimSpace(r.FormValue("limit"))
+
+	if raw == "" {
+		if _, err := db.Exec(context.Background(),
+			`UPDATE licenses SET acc_limit = NULL WHERE license_key = $1`, key); err != nil {
+			http.Error(w, "Database error", http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, r, backTo(r, "Credits removed - unlimited"), http.StatusSeeOther)
+		return
+	}
+
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		http.Redirect(w, r, backTo(r, "Credits must be a number"), http.StatusSeeOther)
+		return
+	}
+	// zero means unlimited, the same as an empty box - store it that way so the
+	// panel shows "unlimited" instead of a confusing "/ 0"
+	if n == 0 {
+		if _, err := db.Exec(context.Background(),
+			`UPDATE licenses SET acc_limit = NULL WHERE license_key = $1`, key); err != nil {
+			http.Error(w, "Database error", http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, r, backTo(r, "Credits removed - unlimited"), http.StatusSeeOther)
+		return
+	}
+	if _, err := db.Exec(context.Background(),
+		`UPDATE licenses SET acc_limit = $1 WHERE license_key = $2`, n, key); err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, backTo(r, "Credits updated"), http.StatusSeeOther)
+}
+
 func handleUsage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1009,6 +1142,20 @@ func handleUsage(w http.ResponseWriter, r *http.Request) {
 	if subtle.ConstantTimeCompare([]byte(req.Token), []byte(generateToken(*existingDevice))) != 1 {
 		writeJSON(w, http.StatusForbidden, ActivationResponse{Status: "invalid", Error: "Bad token."})
 		return
+	}
+
+	// credits: refuse the run outright when it would pass the allowance
+	var accLimit *int
+	_ = db.QueryRow(ctx, `SELECT acc_limit FROM licenses WHERE license_key = $1`, req.Key).Scan(&accLimit)
+	if accLimit != nil && *accLimit > 0 {
+		var used int
+		_ = db.QueryRow(ctx, `SELECT COALESCE(SUM(accounts), 0) FROM runs WHERE license_key = $1`, req.Key).Scan(&used)
+		if used+req.Accounts > *accLimit {
+			writeJSON(w, http.StatusPaymentRequired, ActivationResponse{
+				Status: "limit", Used: used, Limit: *accLimit, Error: "Account limit reached.",
+			})
+			return
+		}
 	}
 
 	// one row per run, with a real timestamp - this is what the rolling
