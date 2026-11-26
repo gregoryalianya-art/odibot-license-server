@@ -285,7 +285,9 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		        COALESCE(u.d_runs, 0),  COALESCE(u.d_acc, 0),
 		        COALESCE(u.w_runs, 0),  COALESCE(u.w_acc, 0),
 		        COALESCE(u.m_runs, 0),  COALESCE(u.m_acc, 0),
-		        COALESCE(u.total_acc, 0),
+		        (SELECT COALESCE(SUM(r.accounts), 0) FROM runs r
+		          WHERE r.license_key = l.license_key
+		            AND r.at >= COALESCE(l.credit_reset_at, '1970-01-01'::timestamptz)) AS total_used,
 		        u.last_run
 		   FROM licenses l
 		   LEFT JOIN (
@@ -652,7 +654,10 @@ const dashboardHTML = `<html>
 		// table and throws you back to the top of the list.
 		document.addEventListener('submit', function (e) {
 			var f = e.target;
-			if (!f || !f.classList || !f.classList.contains('setname')) return;
+			if (!f || !f.classList) return;
+			var isName = f.classList.contains('setname');
+			var isCred = f.classList.contains('creditsrow');
+			if (!isName && !isCred) return;
 			e.preventDefault();
 
 			var btn = f.querySelector('button');
@@ -670,6 +675,17 @@ const dashboardHTML = `<html>
 					if (!resp.ok && resp.status !== 204) throw new Error('http ' + resp.status);
 					btn.textContent = 'Saved';
 					setTimeout(function () { btn.textContent = label; btn.disabled = false; }, 1200);
+					if (isCred) {
+						// a saved limit starts a fresh window, so the counter reads 0
+						var box = f.querySelector('.credbox');
+						var n = parseInt(box ? box.value : '0', 10) || 0;
+						var line = f.parentNode.querySelector('.dev');
+						if (line) {
+							line.textContent = n > 0
+								? '0 acc used / ' + n.toLocaleString()
+								: '0 acc used';
+						}
+					}
 				})
 				.catch(function () {
 					btn.textContent = 'Retry';
@@ -1030,9 +1046,10 @@ func handleQuota(w http.ResponseWriter, r *http.Request) {
 	var device *string
 	var revoked bool
 	var limit *int
+	var resetAt *time.Time
 	if err := db.QueryRow(ctx,
-		`SELECT device_id, COALESCE(revoked, false), acc_limit FROM licenses WHERE license_key = $1`, req.Key).
-		Scan(&device, &revoked, &limit); err != nil {
+		`SELECT device_id, COALESCE(revoked, false), acc_limit, credit_reset_at FROM licenses WHERE license_key = $1`, req.Key).
+		Scan(&device, &revoked, &limit, &resetAt); err != nil {
 		writeJSON(w, http.StatusForbidden, ActivationResponse{Status: "invalid", Error: "Invalid license key."})
 		return
 	}
@@ -1050,13 +1067,25 @@ func handleQuota(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var used int
-	_ = db.QueryRow(ctx, `SELECT COALESCE(SUM(accounts), 0) FROM runs WHERE license_key = $1`, req.Key).Scan(&used)
+	_ = db.QueryRow(ctx, `SELECT COALESCE(SUM(accounts), 0) FROM runs
+	                       WHERE license_key = $1 AND at >= COALESCE($2::timestamptz, '1970-01-01')`,
+		req.Key, resetAt).Scan(&used)
 
 	lim := 0
 	if limit != nil {
 		lim = *limit
 	}
 	writeJSON(w, http.StatusOK, ActivationResponse{Status: "ok", Used: used, Limit: lim})
+}
+
+// creditsReply answers the inline save without a redirect, so the table does not
+// reload and the page keeps its scroll position.
+func creditsReply(w http.ResponseWriter, r *http.Request, msg string) {
+	if r.Header.Get("X-Requested-With") == "fetch" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	http.Redirect(w, r, backTo(r, msg), http.StatusSeeOther)
 }
 
 // handleSetCredits stores the allowance. Empty input means unlimited.
@@ -1077,7 +1106,7 @@ func handleSetCredits(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Database error", http.StatusInternalServerError)
 			return
 		}
-		http.Redirect(w, r, backTo(r, "Credits removed - unlimited"), http.StatusSeeOther)
+		creditsReply(w, r, "Credits removed - unlimited")
 		return
 	}
 
@@ -1094,15 +1123,17 @@ func handleSetCredits(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Database error", http.StatusInternalServerError)
 			return
 		}
-		http.Redirect(w, r, backTo(r, "Credits removed - unlimited"), http.StatusSeeOther)
+		creditsReply(w, r, "Credits removed - unlimited")
 		return
 	}
+	// a saved limit starts a fresh counting window: the customer paid for this
+	// batch, so previous usage must not count against it
 	if _, err := db.Exec(context.Background(),
-		`UPDATE licenses SET acc_limit = $1 WHERE license_key = $2`, n, key); err != nil {
+		`UPDATE licenses SET acc_limit = $1, credit_reset_at = NOW() WHERE license_key = $2`, n, key); err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, backTo(r, "Credits updated"), http.StatusSeeOther)
+	creditsReply(w, r, "Credits updated")
 }
 
 func handleUsage(w http.ResponseWriter, r *http.Request) {
@@ -1163,10 +1194,13 @@ func handleUsage(w http.ResponseWriter, r *http.Request) {
 
 	// credits: refuse the run outright when it would pass the allowance
 	var accLimit *int
-	_ = db.QueryRow(ctx, `SELECT acc_limit FROM licenses WHERE license_key = $1`, req.Key).Scan(&accLimit)
+	var resetAt *time.Time
+	_ = db.QueryRow(ctx, `SELECT acc_limit, credit_reset_at FROM licenses WHERE license_key = $1`, req.Key).Scan(&accLimit, &resetAt)
 	if accLimit != nil && *accLimit > 0 {
 		var used int
-		_ = db.QueryRow(ctx, `SELECT COALESCE(SUM(accounts), 0) FROM runs WHERE license_key = $1`, req.Key).Scan(&used)
+		_ = db.QueryRow(ctx, `SELECT COALESCE(SUM(accounts), 0) FROM runs
+		                       WHERE license_key = $1 AND at >= COALESCE($2::timestamptz, '1970-01-01')`,
+			req.Key, resetAt).Scan(&used)
 		if used+req.Accounts > *accLimit {
 			writeJSON(w, http.StatusPaymentRequired, ActivationResponse{
 				Status: "limit", Used: used, Limit: *accLimit, Error: "Account limit reached.",
