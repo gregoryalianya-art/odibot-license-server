@@ -88,6 +88,7 @@ func main() {
 	http.HandleFunc("/set-name", handleSetName)
 	http.HandleFunc("/revoke", handleRevoke)
 	http.HandleFunc("/restore", handleRestore)
+	http.HandleFunc("/delete", handleDeleteKey)
 	http.HandleFunc("/activate", handleActivate)
 	http.HandleFunc("/verify", handleVerify)
 	http.HandleFunc("/usage", handleUsage)
@@ -433,6 +434,8 @@ const dashboardHTML = `<html>
 		button { padding: 6px 11px; border: 0; border-radius: 5px; cursor: pointer; font-size: 12.5px; }
 		.save { background: #2b2b33; color: #fff; }
 		.revoke { background: #b3261e; color: #fff; }
+		.del { background: #55555f; color: #fff; margin-left: 6px; }
+		.del:hover { background: #33333b; }
 		.restore { background: #0a7d33; color: #fff; }
 		.logout { background: #2b2b33; color: #fff; padding: 8px 14px; }
 		.flash { background: #e8f5e9; border: 1px solid #a5d6a7; color: #1b5e20; padding: 9px 12px; margin-bottom: 12px; border-radius: 6px; font-size: 13px; }
@@ -495,8 +498,10 @@ const dashboardHTML = `<html>
 			td[data-label="Status"] .run { font-size: 10.5px; }
 			td[data-label="Status"] .guid { font-size: 9.5px; line-height: 1.2; margin-top: 1px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 			td[data-label="Action"] { grid-column: 2; grid-row: 3; align-self: start; justify-self: end; margin-top: 3px; }
+			td[data-label="Action"] form { display: block; margin-top: 4px; }
 			td[data-label="Action"] .revoke,
-			td[data-label="Action"] .restore { padding: 4px 10px; font-size: 11.5px; }
+			td[data-label="Action"] .restore,
+			td[data-label="Action"] .del { padding: 4px 10px; font-size: 11.5px; margin: 0; }
 
 			/* 4: 24H / 7D / 30D on one row */
 			td[data-label="Usage"] { grid-column: 1 / 3; margin-top: 7px; padding-top: 7px; border-top: 1px solid #f0f0f4; }
@@ -575,6 +580,7 @@ const dashboardHTML = `<html>
 						<input type="hidden" name="key" value="{{.Key}}">
 						<input type="hidden" name="page" value="{{$.Page}}">
 						<input type="hidden" name="q" value="{{$.Q}}">
+						<input type="hidden" name="f" value="{{$.Filter}}">
 						<button class="restore" type="submit">Restore</button>
 					</form>
 				{{else}}
@@ -582,9 +588,18 @@ const dashboardHTML = `<html>
 						<input type="hidden" name="key" value="{{.Key}}">
 						<input type="hidden" name="page" value="{{$.Page}}">
 						<input type="hidden" name="q" value="{{$.Q}}">
+						<input type="hidden" name="f" value="{{$.Filter}}">
 						<button class="revoke" type="submit">Revoke</button>
 					</form>
 				{{end}}
+				<form class="inline" action="/delete" method="POST"
+				      onsubmit="return confirm('DELETE THIS KEY PERMANENTLY?\n\n{{.Key}}\n\nIt will never work again and cannot be undone.');">
+					<input type="hidden" name="key" value="{{.Key}}">
+					<input type="hidden" name="page" value="{{$.Page}}">
+					<input type="hidden" name="q" value="{{$.Q}}">
+					<input type="hidden" name="f" value="{{$.Filter}}">
+					<button class="del" type="submit">Delete</button>
+				</form>
 			</td>
 		</tr>
 		{{end}}
@@ -797,6 +812,35 @@ func writeJSON(w http.ResponseWriter, code int, v ActivationResponse) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// handleDeleteKey removes the key for good: the licence, its history and its
+// usage rows. The row is gone, so /activate can never match it again.
+func handleDeleteKey(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	key := strings.TrimSpace(r.FormValue("key"))
+	if key == "" {
+		http.Redirect(w, r, "/?msg=Missing+key", http.StatusSeeOther)
+		return
+	}
+
+	ctx := context.Background()
+
+	// history first, so nothing is left pointing at a key that no longer exists
+	_, _ = db.Exec(ctx, `DELETE FROM runs WHERE license_key = $1`, key)
+	_, _ = db.Exec(ctx, `DELETE FROM usage WHERE license_key = $1`, key)
+
+	res, err := db.Exec(ctx, `DELETE FROM licenses WHERE license_key = $1`, key)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	if res.RowsAffected() == 0 {
+		http.Redirect(w, r, backTo(r, "Key not found"), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, backTo(r, "Key deleted permanently"), http.StatusSeeOther)
+}
 func handleActivate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
